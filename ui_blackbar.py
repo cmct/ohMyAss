@@ -4,6 +4,7 @@
 import os
 import queue
 import statistics
+import tempfile
 import threading
 import tkinter as tk
 from collections import Counter
@@ -16,12 +17,12 @@ except ImportError:
     TkinterDnD = None
     DND_AVAILABLE = False
 try:
-    from PIL import Image
+    from PIL import Image, ImageGrab
 except ImportError:
-    Image = None
+    Image = ImageGrab = None
 
 from app_info import resource_path
-from config_store import log_exception
+from config_store import last_directory, log_exception, remember_directory
 
 import theme_ui
 from theme_ui import (
@@ -53,7 +54,11 @@ class BlackBarDetectorWindow:
         self.analysis_stop = threading.Event()
         self.analysis_active = False
         self._last_analysed_name = ''
+        self._temp_images = []
+        self._display_names = {}
         self.build_ui()
+        self.window.bind('<Control-v>', self._paste_event)
+        self.window.bind('<Control-V>', self._paste_event)
         center_window(self.window, master)
 
     def build_ui(self):
@@ -62,9 +67,9 @@ class BlackBarDetectorWindow:
         content.pack(fill='both', expand=True)
 
         intro = (
-            "通过原盘截图检测上下黑边大小\n"
-            "画面边缘尽量明亮，建议使用多张截图交叉验证\n"
-            "2160p 会自动换算为 1080p 等效像素\n"
+            "通过电影截图检测上下黑边大小\n"
+            "可直接按 Ctrl+V 粘贴网页图片；右击网页图片选择「复制图片」\n"
+            "裁掉黑边的截图会按实际画面比例推算，2160p 自动换算为 1080p\n"
             "检测完成后会自动联动主界面的“中黑边”选项"
         )
         tk.Label(
@@ -72,7 +77,7 @@ class BlackBarDetectorWindow:
             font=(UI_FONT, UI_SMALL_SIZE), justify='center',
         ).pack(pady=(2, 12))
 
-        drop_text = "将图片拖到这里\n或点击“选择图片”按钮"
+        drop_text = "将图片拖到这里\n或点击“选择图片” / 按 Ctrl+V 粘贴"
         if not DND_AVAILABLE:
             drop_text = "拖拽功能需要安装 tkinterdnd2\n可点击此处选择图片"
         self.drop_area = tk.Label(
@@ -86,7 +91,7 @@ class BlackBarDetectorWindow:
             fg=UI_MUTED,
             font=(UI_FONT, UI_BODY_SIZE),
             cursor='hand2',
-            highlightthickness=1,
+            highlightthickness=px(1),
             highlightbackground=UI_BORDER,
         )
         self.drop_area.pack(fill='x', pady=(0, 12))
@@ -99,6 +104,8 @@ class BlackBarDetectorWindow:
         button_frame.pack(pady=(0, 8))
         self.btn_select = ttk.Button(button_frame, text="选择图片", command=self.choose_images, style='Secondary.TButton')
         self.btn_select.pack(side='left', padx=6)
+        self.btn_paste = ttk.Button(button_frame, text="粘贴图片（Ctrl+V）", command=self.paste_clipboard, style='Secondary.TButton')
+        self.btn_paste.pack(side='left', padx=6)
         self.btn_clear = ttk.Button(button_frame, text="清空结果", command=self.clear_results, style='Secondary.TButton')
         self.btn_clear.pack(side='left', padx=6)
 
@@ -116,7 +123,7 @@ class BlackBarDetectorWindow:
             style='Blue.Horizontal.TProgressbar')
         self.progress.pack(side='left', fill='x', expand=True)
 
-        result_frame = tk.Frame(content, bg=UI_CARD, highlightthickness=1,
+        result_frame = tk.Frame(content, bg=UI_CARD, highlightthickness=px(1),
                                 highlightbackground=UI_BORDER, highlightcolor=UI_BORDER)
         result_frame.pack(fill='both', expand=True)
         scrollbar = ttk.Scrollbar(result_frame, orient='vertical')
@@ -152,16 +159,79 @@ class BlackBarDetectorWindow:
             return
         self.analyse_images(images)
 
+    def _paste_event(self, event=None):
+        self.paste_clipboard()
+        return 'break'
+
+    def paste_clipboard(self):
+        """从剪贴板读取网页图片或图片文件路径。"""
+        if ImageGrab is None:
+            messagebox.showerror(
+                '缺少依赖',
+                '剪贴板图片需要 Pillow。请先运行：pip install pillow',
+                parent=self.window)
+            return
+        if self.analysis_active:
+            return
+        try:
+            data = ImageGrab.grabclipboard()
+        except Exception as exc:
+            log_exception('读取剪贴板图片', exc)
+            messagebox.showerror(
+                '无法读取剪贴板', str(exc), parent=self.window)
+            return
+        if data is None:
+            messagebox.showinfo(
+                '剪贴板中没有图片',
+                '请先在网页图片上右击选择「复制图片」，再按 Ctrl+V。',
+                parent=self.window)
+            return
+        paths = []
+        if isinstance(data, list):
+            paths = [
+                os.fspath(path) for path in data
+                if os.fspath(path).lower().endswith(IMAGE_EXTENSIONS)
+            ]
+            if not paths:
+                messagebox.showinfo(
+                    '剪贴板中没有图片',
+                    '剪贴板包含的是文件路径，但没有可识别的图片文件。',
+                    parent=self.window)
+                return
+        elif isinstance(data, Image.Image):
+            try:
+                handle, path = tempfile.mkstemp(
+                    prefix='ohMyAssNoto_paste_', suffix='.png')
+                os.close(handle)
+                data.save(path, 'PNG')
+            except Exception as exc:
+                log_exception('保存剪贴板图片', exc)
+                messagebox.showerror(
+                    '无法保存剪贴板图片', str(exc), parent=self.window)
+                return
+            self._temp_images.append(path)
+            self._display_names[path] = '剪贴板图片'
+            paths = [path]
+        else:
+            messagebox.showinfo(
+                '剪贴板中没有图片',
+                '当前剪贴板内容不是图片。',
+                parent=self.window)
+            return
+        self.analyse_images(paths)
+
     def choose_images(self):
         paths = filedialog.askopenfilenames(
             title="选择电影截图",
             parent=self.window,
+            initialdir=last_directory('blackbar_file'),
             filetypes=[
                 ("图片文件", "*.jpg *.jpeg *.png *.bmp *.tif *.tiff *.webp"),
                 ("所有文件", "*.*"),
             ],
         )
         if paths:
+            remember_directory('blackbar_file', paths[0])
             self.analyse_images(list(paths))
 
     def clear_results(self):
@@ -192,8 +262,8 @@ class BlackBarDetectorWindow:
             # 上一批还在检测，忽略新的拖放/选择，避免结果串批
             return
 
-        self.btn_select.config(state='disabled')
-        self.btn_clear.config(state='disabled')
+        for button in (self.btn_select, self.btn_paste, self.btn_clear):
+            button.config(state='disabled')
         self.results = []
         self.result_text.config(state='normal')
         self.result_text.delete('1.0', 'end')
@@ -211,7 +281,8 @@ class BlackBarDetectorWindow:
         for index, path in enumerate(paths, 1):
             if self.analysis_stop.is_set():
                 break
-            filename = os.path.basename(path)
+            filename = self._display_names.get(
+                path, os.path.basename(path))
             self.analysis_queue.put(('start', index, total, filename))
 
             def progress_callback(current, maximum):
@@ -256,16 +327,22 @@ class BlackBarDetectorWindow:
     def _add_analysis_result(self, result):
         self.results.append(result)
         mid_hint = '勾选' if result['type'] == '中黑边' else '不勾选'
-        self.append_result(
-            f"【{self._last_analysed_name}】\n"
-            f"分辨率：{result['width']}×{result['height']}\n"
-            f"上黑边：{result['top']} px\n"
-            f"下黑边：{result['bottom']} px\n"
-            f"总黑边：{result['top'] + result['bottom']} px\n"
-            f"1080p 等效下黑边：{result['scaled_bottom']:.1f} px\n"
-            f"黑边类型：{result['type']}\n"
-            f"中黑边勾选参考：{mid_hint}\n"
-        )
+        lines = [f"【{self._last_analysed_name}】"]
+        lines.append(f"分辨率：{result['width']}×{result['height']}")
+        if result.get('cropped'):
+            lines.append("截图上下黑边：0 / 0 px（截图已裁切）")
+        else:
+            lines.append(f"上黑边：{result['top']} px")
+            lines.append(f"下黑边：{result['bottom']} px")
+            lines.append(f"总黑边：{result['top'] + result['bottom']} px")
+        lines.append(
+            f"实际画面：{result['width']}×{result['content_height']}"
+            f"（{result['aspect']:.2f}:1）")
+        lines.append(
+            f"1080p 等效黑边：{result['scaled_bottom']:.1f} px（按实际画面推算）")
+        lines.append(f"黑边类型：{result['type']}")
+        lines.append(f"中黑边勾选参考：{mid_hint}")
+        self.append_result('\n'.join(lines) + '\n')
 
     def _finish_analysis(self):
         self.analysis_active = False
@@ -278,8 +355,8 @@ class BlackBarDetectorWindow:
 
         self.sync_mid_black_option()
         self.progress['value'] = 0
-        self.btn_select.config(state='normal')
-        self.btn_clear.config(state='normal')
+        for button in (self.btn_select, self.btn_paste, self.btn_clear):
+            button.config(state='normal')
 
     def sync_mid_black_option(self):
         if not self.results:
@@ -299,16 +376,20 @@ class BlackBarDetectorWindow:
     def append_summary(self):
         tops = [item['top'] for item in self.results]
         bottoms = [item['bottom'] for item in self.results]
+        aspects = [item['aspect'] for item in self.results]
         scaled = [item['scaled_bottom'] for item in self.results]
         types = Counter(item['type'] for item in self.results)
         common_type = types.most_common(1)[0][0]
+        cropped_count = sum(1 for item in self.results if item.get('cropped'))
         mid_hint = '勾选' if common_type == '中黑边' else '不勾选'
         self.append_result(
             "【综合结果】\n"
             f"检测图片：{len(self.results)} 张\n"
-            f"上黑边中位数：{statistics.median(tops):.1f} px\n"
-            f"下黑边中位数：{statistics.median(bottoms):.1f} px\n"
-            f"1080p 等效下黑边中位数：{statistics.median(scaled):.1f} px\n"
+            f"截图黑边中位数：上 {statistics.median(tops):.1f} px / "
+            f"下 {statistics.median(bottoms):.1f} px\n"
+            f"实际画面比例中位数：{statistics.median(aspects):.2f}:1\n"
+            f"1080p 等效黑边中位数：{statistics.median(scaled):.1f} px\n"
+            f"已裁切截图：{cropped_count} 张\n"
             f"最多类型：{common_type}\n"
             f"中黑边勾选参考：{mid_hint}\n"
         )
@@ -317,3 +398,13 @@ class BlackBarDetectorWindow:
     def close(self):
         self.analysis_stop.set()
         self.window.destroy()
+        if self._temp_images:
+            def cleanup():
+                for path in self._temp_images:
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+            timer = threading.Timer(1.0, cleanup)
+            timer.daemon = True
+            timer.start()

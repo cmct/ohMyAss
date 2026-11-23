@@ -7,7 +7,6 @@ import re
 import queue
 import threading
 import time
-import traceback
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -24,25 +23,25 @@ except ImportError:
 
 from app_info import APP_NAME, APP_VERSION, resource_path, version_tuple
 from config_store import (
-    CONFIG_PATH, get_output_dir, load_config, log_exception,
-    normalize_display_path, save_config,
+    CONFIG_PATH, ERROR_LOG_PATH, get_output_dir, last_directory, load_config,
+    log_exception, normalize_display_path, remember_directory, save_config,
 )
 
 import theme_ui
 from theme_ui import (
     ICON_FIX, ICON_GLOSSARY, ICON_HOME, ICON_PENCIL,
-    ICON_RENDERERS, ICON_SETTINGS, ICON_VIDEO, RoundedFrame,
+    ICON_RENDERERS, ICON_SETTINGS, ICON_TV, ICON_VIDEO, RoundedFrame,
     ToolTip, UI_ACCENT, UI_ACCENT_DARK, UI_BG,
     UI_BODY_SIZE, UI_BORDER, UI_BUTTON_SIZE, UI_CARD,
     UI_DISPLAY_FONT, UI_FIELD, UI_FIELD_BORDER, UI_FIELD_SOFT,
     UI_FONT, UI_ICON_ACTIVE_BG, UI_ICON_CARD_SIZE, UI_ICON_FONT,
     UI_ICON_HOVER_BG, UI_ICON_NAV_SIZE, UI_MODULE_TITLE_SIZE, UI_MUTED,
-    UI_SELECT, UI_SMALL_SIZE, UI_SUCCESS, UI_TEXT,
+    UI_SCALE, UI_SELECT, UI_SMALL_SIZE, UI_SUCCESS, UI_TEXT,
     UI_TREE_HEADER, UI_TROUGH, UI_WARNING, add_combo_arrow,
     apply_palette, center_window, create_card, create_hero,
-    hex_to_rgb, pick_ui_fonts, prepare_combobox, px,
+    hex_to_rgb, monitor_dpi_for_window, pick_ui_fonts, prepare_combobox, px,
     recolor_widget_tree, register_bundled_fonts, render_camera_icon, render_gear_icon,
-    render_pencil_icon, render_wrench_icon, rounded_rect, system_uses_dark_theme,
+    render_pencil_icon, render_tv_icon, render_wrench_icon, rounded_rect, system_uses_dark_theme,
     theme_fg_map, theme_is_dark, theme_mode_from_config, theme_switch_map,
 )
 from reports import NOTICES_DATA_NAME, NOTICES_REPORT_NAME, TAIWAN_REPORT_NAME
@@ -50,7 +49,7 @@ from fonts import (
     ensure_source_han_font, installed_font_records, source_han_medium_installed,
 )
 from subtitle_core import (
-    FSVP_EDIT_KINDS, FSVP_PAIRS, HDR_SUB_BRIGHTNESS,
+    FSVP_EDIT_KINDS, FSVP_PAIRS, HDR_SUB_BRIGHTNESS, ProcessCancelled,
     STYLE_CATEGORIES, STYLE_KIND_TO_LABEL, STYLE_LABEL_TO_KIND,
     apply_updated_fontsize, apply_updated_margin_v, default_style_line, linked_fsvp_kinds,
     process_file, style_line_name,
@@ -58,6 +57,7 @@ from subtitle_core import (
 from app_update import (
     apply_app_update, discard_app_update, download_app_update, fetch_app_update,
 )
+from task_runner import TaskRunner
 from bdn_sup import (
     BDN_TOOL_ROOT, bdn_tool_version_text, bdn_tools_status_text,
     install_all_bdn_tools,
@@ -67,6 +67,7 @@ from ui_blackbar import BlackBarDetectorWindow
 from ui_style import StyleEditor, StylePreviewWindow
 from ui_fixer import GlossaryPanel, IssueFixerPanel
 from ui_bdn import BdnSupPanel
+from ui_atv import AtvSubsPanel
 
 theme_ui.register_theme_namespace(globals())
 
@@ -169,6 +170,7 @@ def show_error_dialog(title: str, message: str, log_path: str = '', parent=None)
 class App:
     def __init__(self, root):
         self.root = root
+        self._install_exception_hooks()
         register_bundled_fonts()
         self.root.title(f"{APP_NAME} {APP_VERSION}")
         self.root.geometry(f"{px(1000)}x{px(880)}")
@@ -186,8 +188,9 @@ class App:
         self.preview_window = None
         self.mid_black_px = None
         self.processing = False
+        self.process_cancel = threading.Event()
         self.text_out_auto = True
-        self.result_queue = queue.Queue()
+        self.process_runner = TaskRunner(root, 100)
         self.nav_photo_cache = {}
         self.app_update_checking = False
         self.app_update_url = ''
@@ -227,9 +230,60 @@ class App:
             self.mid_black_px = None
         self.last_error_log = str(config.get('last_error_log') or '')
         self.update_brightness_state()
+        self._dpi_notice_scale = None
+        self._dpi_check_job = None
+        self.root.bind('<Configure>', self._schedule_dpi_check, add='+')
         self.root.after(200, self._poll_app_update)
         if getattr(sys, 'frozen', False):
             self.root.after(2500, lambda: self.check_app_update(silent=True))
+
+    def _schedule_dpi_check(self, event=None):
+        if event is not None and event.widget is not self.root:
+            return
+        if self._dpi_check_job is not None:
+            try:
+                self.root.after_cancel(self._dpi_check_job)
+            except tk.TclError:
+                pass
+        self._dpi_check_job = self.root.after(1200, self._check_monitor_dpi)
+
+    def _check_monitor_dpi(self):
+        self._dpi_check_job = None
+        try:
+            if not self.root.winfo_exists():
+                return
+            hwnd = self.root.winfo_id()
+        except tk.TclError:
+            return
+        dpi = monitor_dpi_for_window(hwnd)
+        if not dpi:
+            return
+        scale = max(1.0, dpi / 96.0)
+        if abs(scale - UI_SCALE) < 0.2:
+            return
+        key = round(scale, 2)
+        if key == self._dpi_notice_scale:
+            return
+        self._dpi_notice_scale = key
+        self.root.after(10, lambda: messagebox.showinfo(
+            '显示缩放',
+            f'当前显示器的缩放为 {int(round(scale * 100))}%，'
+            f'软件启动时按 {int(round(UI_SCALE * 100))}% 创建界面。\n\n'
+            '如需最佳显示效果，请把窗口移到该显示器后重新启动软件。',
+            parent=self.root))
+
+    def _install_exception_hooks(self):
+        """把界面回调里未捕获的异常写进日志并提示，避免窗口模式静默失败。"""
+        def report_callback_exception(_exc_type, value, _tb):
+            log_exception('界面回调异常', value)
+            try:
+                messagebox.showerror(
+                    '程序错误',
+                    f'操作出现异常：{value}\n\n详细信息已写入：\n{ERROR_LOG_PATH}',
+                    parent=self.root)
+            except tk.TclError:
+                pass
+        self.root.report_callback_exception = report_callback_exception
 
     def _virtual_screen_bounds(self):
         try:
@@ -337,8 +391,13 @@ class App:
 
     def on_close(self):
         if self.processing:
-            messagebox.showinfo(
-                '正在生成', '字幕正在生成，请等待完成后再退出。', parent=self.root)
+            if not messagebox.askyesno(
+                    '正在生成',
+                    '字幕正在生成，确定要取消并退出吗？', parent=self.root):
+                return
+            self.cancel_process()
+            self._close_wait_count = 0
+            self._wait_process_cancel_and_close()
             return
         if getattr(self, 'sup_panel', None) and self.sup_panel.running:
             if not messagebox.askyesno('正在生成', 'SUP 正在生成中，确定要退出吗？', parent=self.root):
@@ -357,6 +416,17 @@ class App:
         self._save_config_and_destroy()
 
     def _save_config_and_destroy(self):
+        try:
+            self.process_cancel.set()
+            self.process_runner.stop()
+        except Exception:
+            pass
+        fixer = getattr(self, 'fixer_panel', None)
+        if fixer is not None:
+            try:
+                fixer.task_runner.stop()
+            except Exception:
+                pass
         config = load_config()
         config.pop('sup_font_dir', None)
         config.update(self._current_config_values())
@@ -377,6 +447,14 @@ class App:
                 and getattr(self, '_close_wait_count', 0) < 50):
             self._close_wait_count += 1
             self.root.after(100, self._wait_sup_cancel_and_close)
+            return
+        self._save_config_and_destroy()
+
+    def _wait_process_cancel_and_close(self):
+        if (self.processing
+                and getattr(self, '_close_wait_count', 0) < 50):
+            self._close_wait_count += 1
+            self.root.after(100, self._wait_process_cancel_and_close)
             return
         self._save_config_and_destroy()
 
@@ -563,7 +641,7 @@ class App:
 
         for key, label in (('home', '主页'), ('ass', '文本字幕'),
                            ('glossary', '术语表'), ('fix', '问题修复'),
-                           ('sup', '图形字幕')):
+                           ('sup', '图形字幕'), ('atv', '流媒体字幕')):
             add_nav(key, label)
         tk.Frame(nav, bg=UI_BG).pack(fill='y', expand=True)
         add_nav('settings', '设置', side='bottom')
@@ -573,26 +651,52 @@ class App:
                        padx=(px(6), px(24)), pady=px(12))
 
         self.pages = {
-            'home': tk.Frame(container, bg=UI_BG),
-            'ass': tk.Frame(container, bg=UI_BG),
-            'glossary': tk.Frame(container, bg=UI_BG),
-            'fix': tk.Frame(container, bg=UI_BG),
-            'sup': tk.Frame(container, bg=UI_BG),
-            'settings': tk.Frame(container, bg=UI_BG),
+            key: tk.Frame(container, bg=UI_BG)
+            for key in ('home', 'ass', 'glossary', 'fix', 'sup', 'atv', 'settings')
         }
-        self.build_home_page(self.pages['home'])
-        self.build_ass_page(self.pages['ass'])
-        self.glossary_panel = GlossaryPanel(self.pages['glossary'])
-        self.glossary_panel.pack(fill='both', expand=True)
-        self.fixer_panel = IssueFixerPanel(self.pages['fix'])
-        self.fixer_panel.pack(fill='both', expand=True)
-        self.sup_panel = BdnSupPanel(self.pages['sup'])
-        self.sup_panel.pack(fill='both', expand=True)
-        self.build_settings_page(self.pages['settings'])
+        self._built_pages = set()
+        self._page_builders = {
+            'home': lambda: self.build_home_page(self.pages['home']),
+            'ass': lambda: self.build_ass_page(self.pages['ass']),
+            'glossary': self._build_glossary_page,
+            'fix': self._build_fix_page,
+            'sup': self._build_sup_page,
+            'atv': self._build_atv_page,
+            'settings': lambda: self.build_settings_page(self.pages['settings']),
+        }
+        # 主页、文本字幕、术语表、设置在启动时就要用到（设置页含更新检查控件，
+        # 冻结模式启动 2.5 秒后会自动检查更新），问题修复 / 图形字幕首次进入时再构建
+        for key in ('home', 'ass', 'glossary', 'settings'):
+            self._ensure_page(key)
         self.active_page = 'home'
         self.switch_tab('home')
 
+    def _build_glossary_page(self):
+        self.glossary_panel = GlossaryPanel(self.pages['glossary'])
+        self.glossary_panel.pack(fill='both', expand=True)
+
+    def _build_fix_page(self):
+        self.fixer_panel = IssueFixerPanel(self.pages['fix'])
+        self.fixer_panel.pack(fill='both', expand=True)
+
+    def _build_sup_page(self):
+        self.sup_panel = BdnSupPanel(self.pages['sup'])
+        self.sup_panel.pack(fill='both', expand=True)
+
+    def _build_atv_page(self):
+        self.atv_panel = AtvSubsPanel(self.pages['atv'])
+        self.atv_panel.pack(fill='both', expand=True)
+
+    def _ensure_page(self, key):
+        if key in self._built_pages:
+            return
+        builder = self._page_builders.get(key)
+        if builder is not None:
+            builder()
+        self._built_pages.add(key)
+
     def switch_tab(self, key):
+        self._ensure_page(key)
         self.active_page = key
         for name, page in self.pages.items():
             if name == key:
@@ -607,10 +711,12 @@ class App:
     def redraw_nav(self, hover=None):
         glyphs = {'home': ICON_HOME, 'ass': ICON_PENCIL,
                   'glossary': ICON_GLOSSARY, 'fix': ICON_FIX,
-                  'sup': ICON_VIDEO, 'settings': ICON_SETTINGS}
+                  'sup': ICON_VIDEO, 'atv': ICON_TV,
+                  'settings': ICON_SETTINGS}
         icon_kinds = {'home': 'home', 'ass': 'pencil',
                       'glossary': 'glossary', 'fix': 'fix',
-                      'sup': 'frame', 'settings': 'settings'}
+                      'sup': 'frame', 'atv': 'tv',
+                      'settings': 'settings'}
         for key, canvas in self.nav_icons.items():
             active = key == self.active_page
             canvas.delete('all')
@@ -671,6 +777,9 @@ class App:
         self.build_module_card(
             cards, 2, 0, 'settings', '设置',
             '工具版本、字体安装与在线更新', 'settings')
+        self.build_module_card(
+            cards, 2, 1, 'tv', '流媒体字幕',
+            '按 IMDB / 片名抓取 Apple TV 全地区、全语言字幕。', 'atv')
 
     def build_module_card(self, parent, row, column, kind, title, description, target):
         card = RoundedFrame(parent, radius=8)
@@ -681,11 +790,12 @@ class App:
         inner = tk.Frame(card.body, bg=UI_CARD, padx=px(20), pady=px(18))
         inner.pack(fill='both', expand=True)
 
-        glyph = {'pencil': ICON_PENCIL, 'frame': ICON_VIDEO, 'fix': ICON_FIX,
+        glyph = {'pencil': ICON_PENCIL, 'frame': ICON_VIDEO,
+                 'tv': ICON_TV, 'fix': ICON_FIX,
                  'glossary': ICON_GLOSSARY,
                  'settings': ICON_SETTINGS}.get(kind, ICON_PENCIL)
         renderer = {'pencil': render_pencil_icon, 'fix': render_wrench_icon,
-                    'frame': render_camera_icon,
+                    'frame': render_camera_icon, 'tv': render_tv_icon,
                     'settings': render_gear_icon}.get(kind)
         photo = None
         if renderer is not None and ImageTk is not None:
@@ -753,8 +863,11 @@ class App:
         self.output_root_entry.grid(row=1, column=1, sticky='ew', pady=4)
         self.output_root_entry.bind(
             '<Key>', lambda event: setattr(self, 'text_out_auto', False), add='+')
-        ttk.Button(file_body, text='选择', command=self.choose_output_root,
-                   style='Secondary.TButton').grid(row=1, column=2, sticky='e', padx=(12, 0), pady=4)
+        self.btn_choose_output = ttk.Button(
+            file_body, text='选择', command=self.choose_output_root,
+            style='Secondary.TButton')
+        self.btn_choose_output.grid(
+            row=1, column=2, sticky='e', padx=(12, 0), pady=4)
         self.file_entry.bind('<FocusOut>', self._normalize_text_entries, add='+')
         self.output_root_entry.bind('<FocusOut>', self._normalize_text_entries, add='+')
 
@@ -848,11 +961,24 @@ class App:
         action.pack(side='bottom', fill='x', pady=(8, 8))
         self.btn_process = ttk.Button(action, text='开始生成', command=self.start_process, style='Accent.TButton')
         self.btn_process.pack(side='left')
+        self.btn_cancel = ttk.Button(
+            action, text='取消', command=self.cancel_process, style='Secondary.TButton')
+        self.btn_cancel.pack(side='left', padx=(8, 0))
+        self.btn_cancel.config(state='disabled')
         self.btn_output_open = ttk.Button(
             action, text='打开输出文件夹', command=self.open_output_folder, style='Secondary.TButton')
         self.btn_output_open.pack(side='left', padx=(10, 0))
         self.status_var = tk.StringVar(value='')
         ttk.Label(action, textvariable=self.status_var, style='Status.TLabel').pack(side='left', padx=(16, 0))
+        self.process_percent = tk.StringVar(value='')
+        self.process_progress = ttk.Progressbar(
+            action, style='Blue.Horizontal.TProgressbar', orient='horizontal',
+            mode='determinate', length=px(160), maximum=100,
+        )
+        self.process_progress.pack(side='right', padx=(10, 0))
+        ttk.Label(
+            action, textvariable=self.process_percent, style='Status.TLabel',
+        ).pack(side='right')
 
     def _init_style_library(self):
         config = load_config()
@@ -978,8 +1104,12 @@ class App:
         messagebox.showinfo('提示', '还没有可打开的输出文件夹', parent=self.root)
 
     def choose_output_root(self):
-        path = filedialog.askdirectory(title='选择输出文件夹', parent=self.root)
+        path = filedialog.askdirectory(
+            title='选择输出文件夹', parent=self.root,
+            initialdir=last_directory(
+                'text_output', self.output_root_entry.get_value()))
         if path:
+            remember_directory('text_output', path)
             self.output_root_entry.set_value(normalize_display_path(path))
             self.text_out_auto = False
 
@@ -1071,6 +1201,10 @@ class App:
         self.tool_state_label.pack(side='left', padx=(10, 0))
         self.btn_update = ttk.Button(card, text='检查更新', command=self.update_tools, style='Secondary.TButton')
         self.btn_update.grid(row=0, column=1, sticky='e')
+        ToolTip(self.btn_update,
+                '检查并更新 SUPer 与官方 ass2bdnxml。\n'
+                'x64 图形字幕实际使用的 bin64\\avs2bdnxml.exe 是随程序内置的修改版，\n'
+                '不会被这个按钮替换。')
         self.refresh_tool_status()
 
         tk.Label(
@@ -1093,7 +1227,8 @@ class App:
         for text, command in (
                 ('打开配置目录', self.open_config_dir),
                 ('打开工具目录', self.open_tool_dir),
-                ('打开日志', self.open_last_log)):
+                ('打开日志', self.open_last_log),
+                ('许可与源码', self.show_licenses)):
             ttk.Button(
                 info_row, text=text, command=command,
                 style='Secondary.TButton').pack(side='left', padx=(0, 8))
@@ -1193,17 +1328,46 @@ class App:
 
     def open_last_log(self):
         path = getattr(self, 'last_error_log', '')
-        if path and os.path.isfile(path):
-            try:
-                os.startfile(path)
-                return
-            except OSError as exc:
-                messagebox.showerror('无法打开日志', str(exc), parent=self.root)
-                return
+        for candidate in (path, ERROR_LOG_PATH):
+            if candidate and os.path.isfile(candidate):
+                try:
+                    os.startfile(candidate)
+                    return
+                except OSError as exc:
+                    messagebox.showerror(
+                        '无法打开日志', str(exc), parent=self.root)
+                    return
         messagebox.showinfo(
             '提示',
-            '暂时没有错误日志。\n生成失败时会在源字幕目录写入 ohMyAssNoto_error.log。',
+            f'暂时没有错误日志。\n生成失败时会写入：\n{ERROR_LOG_PATH}',
             parent=self.root)
+
+    def show_licenses(self):
+        dialog = tk.Toplevel(self.root)
+        dialog.title('第三方许可与源码')
+        dialog.geometry('900x700')
+        dialog.transient(self.root)
+        frame = tk.Frame(dialog, bg=UI_BG)
+        frame.pack(fill='both', expand=True)
+        text = tk.Text(
+            frame, wrap='word', bg=UI_CARD, fg=UI_TEXT,
+            font=(UI_FONT, UI_BODY_SIZE), padx=12, pady=10,
+            relief='flat', borderwidth=0)
+        scroll = ttk.Scrollbar(frame, orient='vertical', command=text.yview)
+        text.configure(yscrollcommand=scroll.set)
+        scroll.pack(side='right', fill='y')
+        text.pack(side='left', fill='both', expand=True)
+        for name in ('LICENSE', 'THIRD_PARTY_NOTICES.md', 'SOURCE.md'):
+            text.insert('end', f'\n===== {name} =====\n\n')
+            try:
+                with open(resource_path(name), 'r', encoding='utf-8') as handle:
+                    text.insert('end', handle.read())
+            except OSError as exc:
+                text.insert('end', f'无法读取：{exc}\n')
+        text.config(state='disabled')
+        ttk.Button(
+            dialog, text='关闭', command=dialog.destroy,
+            style='Secondary.TButton').pack(pady=8)
 
     def install_font(self):
         if getattr(self, 'font_installing', False):
@@ -1276,6 +1440,8 @@ class App:
 
     def _poll_app_update(self):
         try:
+            if not self.root.winfo_exists():
+                return
             while True:
                 item = self.app_update_queue.get_nowait()
                 kind = item[0]
@@ -1524,13 +1690,18 @@ class App:
             self.text_out_auto = True
 
     def openFile(self):
-        file_path = filedialog.askopenfilename(filetypes=[
-            ("字幕文件", "*.ass *.srt"),
-            ("ASS 字幕", "*.ass"),
-            ("SRT 字幕", "*.srt"),
-            ("所有文件", "*.*"),
-        ])
+        if self.processing:
+            return
+        file_path = filedialog.askopenfilename(
+            initialdir=last_directory('text_file', self.file_entry.get_value()),
+            filetypes=[
+                ("字幕文件", "*.ass *.srt"),
+                ("ASS 字幕", "*.ass"),
+                ("SRT 字幕", "*.srt"),
+                ("所有文件", "*.*"),
+            ])
         if file_path:
+            remember_directory('text_file', file_path)
             self._apply_text_source(file_path)
             self.status_var.set('已载入字幕文件')
 
@@ -1538,42 +1709,67 @@ class App:
         self.processing = processing
         state = 'disabled' if processing else 'normal'
         self.btn_process.config(state=state, text='生成中...' if processing else '开始生成')
+        self.btn_cancel.config(state='normal' if processing else 'disabled')
         self.btn_output_open.config(state=state)
         self.btn_black.config(state=state)
         self.btn_open.config(state=state)
+        if hasattr(self, 'btn_choose_output'):
+            self.btn_choose_output.config(state=state)
+        for widget in (
+                self.file_entry, self.output_root_entry, self.title,
+                self.script_updated_by, self.original_script,
+                self.original_translation, self.original_timing,
+                self.original_editing):
+            widget.config(state=state)
         self.option_is_HDR.config(state=state)
         self.option_is_mid_black.config(state=state)
         self.option_use_taiwan.config(state=state)
         self.update_brightness_state()
-        self.status_var.set('正在生成字幕，请稍候...' if processing else '')
+        self.process_progress['value'] = 0
+        if processing:
+            self.process_percent.set('0%')
+            self.status_var.set('正在生成字幕，请稍候...')
+        else:
+            self.process_percent.set('')
 
-    def _process_worker(self, file_name, is_hdr, is_mid_black, meta):
-        try:
-            result = process_file(file_name, is_hdr, is_mid_black, meta)
-            error = None
-        except Exception as exc:
-            log_path = os.path.join(os.path.dirname(os.path.abspath(file_name)), 'ohMyAssNoto_error.log')
-            try:
-                with open(log_path, 'w', encoding='utf-8') as f:
-                    f.write(traceback.format_exc())
-            except OSError as log_exc:
-                # 源目录不可写时改写到用户目录日志
-                log_exception('写入生成错误日志', log_exc)
-            result = None
-            error = str(exc)
-            self.last_error_log = log_path
-        self.result_queue.put((result, error, is_hdr))
+    def _process_event(self, kind, *payload):
+        if kind == 'progress':
+            self._update_process_progress(*payload)
+            return True
+        if kind == 'error':
+            self._process_finished(None, payload[0], False)
+            return False
+        self._process_finished(payload[0], payload[1], payload[2])
+        return False
 
-    def _poll_process_result(self):
-        try:
-            result, error, is_hdr = self.result_queue.get_nowait()
-        except queue.Empty:
-            self.root.after(100, self._poll_process_result)
+    def _update_process_progress(self, value, message=''):
+        value = max(0, min(100, int(value)))
+        self.process_progress['value'] = value
+        self.process_percent.set(f'{value}%')
+        if message:
+            self.status_var.set(message)
+
+    def cancel_process(self):
+        if not self.processing:
             return
-        self._process_finished(result, error, is_hdr)
+        self.process_cancel.set()
+        self.btn_cancel.config(state='disabled')
+        self.status_var.set('正在取消…')
 
     def _process_finished(self, result, error, is_hdr):
+        try:
+            if not self.root.winfo_exists():
+                return
+        except tk.TclError:
+            return
         self._set_processing_state(False)
+        if error == 'cancelled':
+            self.status_var.set('已取消生成')
+            messagebox.showinfo(
+                "已取消",
+                "生成已取消。输出文件夹中可能保留了已经写出的字幕文件，建议重新生成一次。",
+                parent=self.root)
+            return
         if error:
             show_error_dialog(
                 "生成失败",
@@ -1582,6 +1778,7 @@ class App:
             return
         html_path, output_dir, chinese_only = result
         self.last_output_dir = output_dir
+        self._ensure_page('fix')
         auto_loaded = False
         fixer = getattr(self, 'fixer_panel', None)
         json_path = os.path.join(output_dir, NOTICES_DATA_NAME)
@@ -1694,10 +1891,28 @@ class App:
         save_config(config)
 
         self._set_processing_state(True)
-        thread = threading.Thread(
-            target=self._process_worker,
-            args=(file_name, self.is_HDR.get(), self.is_mid_black.get(), meta),
-            daemon=True,
-        )
-        thread.start()
-        self.root.after(100, self._poll_process_result)
+        self.process_cancel = threading.Event()
+        is_hdr = bool(self.is_HDR.get())
+        is_mid_black = bool(self.is_mid_black.get())
+        cancel_event = self.process_cancel
+
+        def work(emit):
+            try:
+                result = process_file(
+                    file_name, is_hdr, is_mid_black, meta,
+                    progress=lambda value, message='': emit(
+                        'progress', value, message),
+                    cancel_event=cancel_event,
+                )
+                error = None
+            except ProcessCancelled:
+                result = None
+                error = 'cancelled'
+            except Exception as exc:
+                log_exception('生成字幕', exc)
+                self.last_error_log = ERROR_LOG_PATH
+                result = None
+                error = str(exc)
+            emit('result', result, error, is_hdr)
+
+        self.process_runner.start(work, self._process_event)

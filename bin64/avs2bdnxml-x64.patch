@@ -1,0 +1,505 @@
+--- a/avs2bdnxml.c
++++ b/avs2bdnxml.c
+@@ -168,7 +168,7 @@
+  */
+ #ifndef LINUX
+ #include <windows.h>
+-#include <vfw.h>
++#include "avisynth_c_loader.h"
+ #endif
+ 
+ #ifndef LINUX
+@@ -187,7 +187,10 @@
+ 
+ typedef struct {
+ #if !defined(LINUX)
+-    PAVISTREAM p_avi;
++    AVS_Library *lib;
++    AVS_ScriptEnvironment *env;
++    AVS_Clip *clip;
++    const AVS_VideoInfo *vi;
+ #else
+     int fps_den;
+     int fps_num;
+@@ -204,58 +207,128 @@
+     int i_fps_num;
+ } stream_info_t;
+ 
++#if !defined(LINUX)
++static void print_avs_error(avis_input_t *h, const char *where)
++{
++    const char *err = NULL;
++    if (h && h->lib && h->lib->avs_get_error && h->env)
++        err = h->lib->avs_get_error(h->env);
++    fprintf(stderr, "avis [error]: %s%s%s\n", where,
++            err ? ": " : "", err ? err : "");
++}
++
++static char *read_script_file(const char *path)
++{
++    FILE *fh = fopen(path, "rb");
++    long size;
++    char *text;
++
++    if (!fh)
++        return NULL;
++    if (fseek(fh, 0, SEEK_END) != 0 ||
++        (size = ftell(fh)) < 0 ||
++        fseek(fh, 0, SEEK_SET) != 0) {
++        fclose(fh);
++        return NULL;
++    }
++    text = (char *)malloc((size_t)size + 1);
++    if (!text) {
++        fclose(fh);
++        return NULL;
++    }
++    if (size > 0 && fread(text, 1, (size_t)size, fh) != (size_t)size) {
++        free(text);
++        fclose(fh);
++        return NULL;
++    }
++    fclose(fh);
++    text[size] = '\0';
++    /* AviSynth's parser does not want a UTF-8 BOM. */
++    if (size >= 3 && (unsigned char)text[0] == 0xEF &&
++        (unsigned char)text[1] == 0xBB && (unsigned char)text[2] == 0xBF)
++        memmove(text, text + 3, (size_t)(size - 2));
++    return text;
++}
++#endif
++
+ int open_file_avis( char *psz_filename, avis_input_t **p_handle, stream_info_t *p_param )
+ {
+-    avis_input_t *h = malloc(sizeof(avis_input_t));
++    avis_input_t *h = calloc(1, sizeof(avis_input_t));
++    *p_handle = h;
+ #if !defined(LINUX)
+-    AVISTREAMINFO info;
+-    int i;
+-
+-    *p_handle = h;
+-
+-    AVIFileInit();
+-    if( AVIStreamOpenFromFile( &h->p_avi, psz_filename, streamtypeVIDEO, 0, OF_READ, NULL ) )
+-    {
+-        AVIFileExit();
++    char *script = read_script_file(psz_filename);
++    AVS_Value script_arg, script_args, result;
++
++    if (!script) {
++        fprintf(stderr, "avis [error]: cannot read AviSynth script: %s\n", psz_filename);
++        free(h);
+         return -1;
+     }
+ 
+-    if( AVIStreamInfo(h->p_avi, &info, sizeof(AVISTREAMINFO)) )
+-    {
+-        AVIStreamRelease(h->p_avi);
+-        AVIFileExit();
++    h->lib = avs_load_library(NULL);
++    if (!h->lib) {
++        fprintf(stderr, "avis [error]: cannot load AviSynth.dll\n");
++        free(script);
++        free(h);
+         return -1;
+     }
+ 
+-    /* Check input format */
+-    if (info.fccHandler != MAKEFOURCC('D', 'I', 'B', ' '))
+-    {
+-        fprintf( stderr, "avis [error]: unsupported input format (%c%c%c%c)\n",
+-            (char)(info.fccHandler & 0xff), (char)((info.fccHandler >> 8) & 0xff),
+-            (char)((info.fccHandler >> 16) & 0xff), (char)((info.fccHandler >> 24)) );
+-
+-        AVIStreamRelease(h->p_avi);
+-        AVIFileExit();
+-
++    h->env = avs_library_create_script_environment(h->lib);
++    if (!h->env || avs_library_env_failed(h->lib, h->env)) {
++        print_avs_error(h, "cannot create AviSynth environment");
++        avs_free_library(h->lib);
++        free(script);
++        free(h);
+         return -1;
+     }
+ 
+-    h->width =
+-    p_param->i_width = info.rcFrame.right - info.rcFrame.left;
+-    h->height =
+-    p_param->i_height = info.rcFrame.bottom - info.rcFrame.top;
+-    i = gcd(info.dwRate, info.dwScale);
+-    p_param->i_fps_den = info.dwScale / i;
+-    p_param->i_fps_num = info.dwRate / i;
++    script_arg = avs_new_value_string(script);
++    script_args = avs_new_value_array(&script_arg, 1);
++    result = h->lib->avs_invoke(h->env, "Eval", script_args, NULL);
++    free(script);
++
++    if (avs_is_error(result) || !avs_is_clip(result)) {
++        print_avs_error(h, "AviSynth Eval failed");
++        if (!avs_is_error(result))
++            h->lib->avs_release_value(result);
++        h->lib->avs_delete_script_environment(h->env);
++        avs_free_library(h->lib);
++        free(h);
++        return -1;
++    }
++
++    h->clip = h->lib->avs_take_clip(result, h->env);
++    h->lib->avs_release_value(result);
++    if (!h->clip) {
++        print_avs_error(h, "AviSynth returned no clip");
++        h->lib->avs_delete_script_environment(h->env);
++        avs_free_library(h->lib);
++        free(h);
++        return -1;
++    }
++
++    h->vi = h->lib->avs_get_video_info(h->clip);
++    if (!h->vi || !avs_has_video(h->vi) || !avs_is_rgb32(h->vi)) {
++        fprintf(stderr, "avis [error]: script must output RGB32 video\n");
++        h->lib->avs_release_clip(h->clip);
++        h->lib->avs_delete_script_environment(h->env);
++        avs_free_library(h->lib);
++        free(h);
++        return -1;
++    }
++
++    h->width = p_param->i_width = h->vi->width;
++    h->height = p_param->i_height = h->vi->height;
++    p_param->i_fps_num = (int)h->vi->fps_numerator;
++    p_param->i_fps_den = (int)h->vi->fps_denominator;
+ 
+     fprintf( stderr, "avis [info]: %dx%d @ %.2f fps (%d frames)\n",
+         p_param->i_width, p_param->i_height,
+         (double)p_param->i_fps_num / (double)p_param->i_fps_den,
+-        (int)info.dwLength );
++        h->vi->num_frames );
+ 
+     return 0;
+ #else
+-    *p_handle = h;
+     p_param->i_width = 1920;
+     p_param->i_height = 1080;
+     p_param->i_fps_den = 30000;
+@@ -266,20 +339,14 @@
+     h->fps_num = p_param->i_fps_num;
+     h->fh = fopen(psz_filename, "r");
+     h->frames = 15000;
+-		return 0;
++    return 0;
+ #endif
+ }
+ 
+ int get_frame_total_avis( avis_input_t *handle )
+ {
+ #if !defined(LINUX)
+-    avis_input_t *h = handle;
+-    AVISTREAMINFO info;
+-
+-    if( AVIStreamInfo(h->p_avi, &info, sizeof(AVISTREAMINFO)) )
+-        return -1;
+-
+-    return info.dwLength;
++    return handle->vi ? handle->vi->num_frames : -1;
+ #else
+     return handle->frames;
+ #endif
+@@ -289,10 +356,28 @@
+ {
+ #if !defined(LINUX)
+     avis_input_t *h = handle;
+-
+-    if( AVIStreamRead(h->p_avi, i_frame, 1, p_pic, h->width * h->height * 4, NULL, NULL ) )
++    AVS_VideoFrame *frame = h->lib->avs_get_frame(h->clip, i_frame);
++    const BYTE *src;
++    int pitch, rowbytes, y;
++
++    if (!frame) {
++        const char *err = h->lib->avs_clip_get_error(h->clip);
++        fprintf(stderr, "avis [error]: cannot read frame %d%s%s\n",
++                i_frame, err ? ": " : "", err ? err : "");
+         return -1;
+-
++    }
++
++    src = h->lib->avs_get_read_ptr_p(frame, 0);
++    pitch = h->lib->avs_get_pitch_p(frame, 0);
++    rowbytes = h->width * 4;
++    if (!src || pitch < rowbytes) {
++        h->lib->avs_release_video_frame(frame);
++        return -1;
++    }
++    for (y = 0; y < h->height; y++)
++        memcpy(p_pic + (size_t)y * rowbytes, src + (size_t)y * pitch, rowbytes);
++
++    h->lib->avs_release_video_frame(frame);
+     return 0;
+ #else
+     fread(p_pic, 4, handle->width * handle->height, handle->fh);
+@@ -304,14 +389,56 @@
+ {
+ #if !defined(LINUX)
+     avis_input_t *h = handle;
+-    AVIStreamRelease(h->p_avi);
+-    AVIFileExit();
++    if (h->clip)
++        h->lib->avs_release_clip(h->clip);
++    if (h->env)
++        h->lib->avs_delete_script_environment(h->env);
++    if (h->lib)
++        avs_free_library(h->lib);
+     free(h);
+     return 0;
+ #else
+     fclose((FILE *)handle);
+     return 0;
+ #endif
++}
++
++/* Optional active-frame ranges.  Each line is "start end", end exclusive. */
++static int *active_ranges = NULL;
++static int active_range_count = 0;
++
++static int load_active_ranges(const char *path)
++{
++    FILE *fh = fopen(path, "r");
++    int start, end;
++    int capacity = 64;
++
++    if (!fh)
++        return -1;
++    active_ranges = malloc((size_t)capacity * 2 * sizeof(int));
++    if (!active_ranges) {
++        fclose(fh);
++        return -1;
++    }
++    while (fscanf(fh, "%d %d", &start, &end) == 2) {
++        if (end <= start)
++            continue;
++        if (active_range_count == capacity) {
++            int *grown;
++            capacity *= 2;
++            grown = realloc(active_ranges, (size_t)capacity * 2 * sizeof(int));
++            if (!grown) {
++                fclose(fh);
++                return -1;
++            }
++            active_ranges = grown;
++        }
++        active_ranges[active_range_count * 2] = start;
++        active_ranges[active_range_count * 2 + 1] = end;
++        active_range_count++;
++    }
++    fclose(fh);
++    return 0;
+ }
+ 
+ /* AVIS code ends here */
+@@ -449,11 +576,6 @@
+ 	fclose(fh);
+ }
+ 
+-extern int asm_is_identical_sse2 (stream_info_t *s_info, char *img, char *img_old);
+-extern int asm_is_empty_sse2 (stream_info_t *s_info, char *img);
+-extern void asm_zero_transparent_sse2 (stream_info_t *s_info, char volatile *img);
+-extern void asm_swap_rb_sse2 (stream_info_t *s_info, char volatile *img, char volatile *out);
+-
+ int is_identical_c (stream_info_t *s_info, char *img, char *img_old)
+ {
+ 	uint32_t *max = (uint32_t *)(img + s_info->i_width * s_info->i_height * 4);
+@@ -494,7 +616,7 @@
+ 	while (im < max)
+ 	{
+ 		if (!im[3])
+-			*(uint32_t *)img = 0;
++			*(uint32_t *)im = 0;
+ 		im += 4;
+ 	}
+ }
+@@ -516,63 +638,32 @@
+ 
+ int detect_sse2 ()
+ {
+-	static int detection = -1;
+-	unsigned int func = 0x00000001;
+-	unsigned int eax, ebx, ecx, edx;
+-
+-	if (detection != -1)
+-		return detection;
+-
+-	asm volatile
+-	(
+-		"cpuid\n"
+-		: "=a" (eax), "=b" (ebx), "=c" (ecx), "=d" (edx)
+-		: "a" (func)
+-	);
+-
+-	/* SSE2:  edx & 0x04000000
+-	 * SSSE3: ecx & 0x00000200
+-	 */
+-	detection = (edx & 0x04000000) ? 1 : 0;
+-
+-	if (detection)
+-		fprintf(stderr, "CPU: Using SSE2 optimized functions.\n");
+-	else
+-		fprintf(stderr, "CPU: Using pure C functions.\n");
+-
+-	return detection;
++	static int reported = 0;
++	if (!reported) {
++		fprintf(stderr, "CPU: Using portable C functions.\n");
++		reported = 1;
++	}
++	return 0;
+ }
+ 
+ int is_identical (stream_info_t *s_info, char *img, char *img_old)
+ {
+-	if (detect_sse2())
+-		return asm_is_identical_sse2(s_info, img, img_old);
+-	else
+-		return is_identical_c(s_info, img, img_old);
++	return is_identical_c(s_info, img, img_old);
+ }
+ 
+ int is_empty (stream_info_t *s_info, char *img)
+ {
+-	if (detect_sse2())
+-		return asm_is_empty_sse2(s_info, img);
+-	else
+-		return is_empty_c(s_info, img);
++	return is_empty_c(s_info, img);
+ }
+ 
+ void zero_transparent (stream_info_t *s_info, char *img)
+ {
+-	if (detect_sse2())
+-		return asm_zero_transparent_sse2(s_info, img);
+-	else
+-		return zero_transparent_c(s_info, img);
++	zero_transparent_c(s_info, img);
+ }
+ 
+ void swap_rb (stream_info_t *s_info, char *img, char *out)
+ {
+-	if (detect_sse2())
+-		return asm_swap_rb_sse2(s_info, img, out);
+-	else
+-		return swap_rb_c(s_info, img, out);
++	swap_rb_c(s_info, img, out);
+ }
+ 
+ /* SMPTE non-drop time code */
+@@ -645,10 +736,9 @@
+ 		);
+ }
+ 
+-extern char *rindex(const char *s, int c);
+ int is_extension(char *filename, char *check_ext)
+ {
+-	char *ext = rindex(filename, '.');
++	char *ext = strrchr(filename, '.');
+ 
+ 	if (ext == NULL)
+ 		return 0;
+@@ -824,6 +914,7 @@
+ 	char *allow_empty_string = "0";
+ 	char *stricter_string = "0";
+ 	char *count_string = "2147483647";
++	char *active_ranges_fn = NULL;
+ 	char *in_img = NULL, *old_img = NULL, *tmp = NULL, *out_buf = NULL;
+ 	char *intc_buf = NULL, *outtc_buf = NULL;
+ 	char *drop_frame = NULL;
+@@ -846,6 +937,7 @@
+ 	int first_frame = -1, start_frame = -1, end_frame = -1;
+ 	int num_of_events = 0;
+ 	int i, c, j;
++	int range_index = 0;
+ 	int have_line = 0;
+ 	int must_zero = 0;
+ 	int checked_empty;
+@@ -881,6 +973,7 @@
+ 			{ {"output",       required_argument, 0, 'o'}
+ 			, {"seek",         required_argument, 0, 'j'}
+ 			, {"count",        required_argument, 0, 'c'}
++			, {"active-ranges", required_argument, 0, 'R'}
+ 			, {"trackname",    required_argument, 0, 't'}
+ 			, {"language",     required_argument, 0, 'l'}
+ 			, {"video-format", required_argument, 0, 'v'}
+@@ -902,7 +995,7 @@
+ 			};
+ 			int option_index = 0;
+ 
+-			c = getopt_long(argc, argv, "o:j:c:t:l:v:f:x:y:d:b:s:m:e:p:a:u:n:z:F:", long_options, &option_index);
++			c = getopt_long(argc, argv, "o:j:c:R:t:l:v:f:x:y:d:b:s:m:e:p:a:u:n:z:F:", long_options, &option_index);
+ 			if (c == -1)
+ 				break;
+ 			switch (c)
+@@ -921,6 +1014,9 @@
+ 					break;
+ 				case 'c':
+ 					count_string = optarg;
++					break;
++				case 'R':
++					active_ranges_fn = optarg;
+ 					break;
+ 				case 't':
+ 					track_name = optarg;
+@@ -1090,9 +1186,9 @@
+ 	}
+ 
+ 	/* Align buffers */
+-	in_img  = in_img + (short)(16 - ((long)in_img % 16));
+-	old_img = old_img + (short)(16 - ((long)old_img % 16));
+-	out_buf = out_buf + (short)(16 - ((long)out_buf % 16));
++	in_img  = in_img + (16 - ((uintptr_t)in_img % 16));
++	old_img = old_img + (16 - ((uintptr_t)old_img % 16));
++	out_buf = out_buf + (16 - ((uintptr_t)out_buf % 16));
+ 
+ 	/* Set up buffer (non-)optimization */
+ 	buffer_opt = parse_int(buffer_optimize, "buffer-opt", NULL);
+@@ -1114,6 +1210,12 @@
+ 	}
+ 	last_frame = count_frames + init_frame;
+ 
++	if (active_ranges_fn && load_active_ranges(active_ranges_fn))
++	{
++		fprintf(stderr, "Error reading active ranges: %s\n", active_ranges_fn);
++		return 1;
++	}
++
+ 	/* No frames mean nothing to do */
+ 	if (count_frames < 1)
+ 	{
+@@ -1139,6 +1241,20 @@
+ 	/* Process frames */
+ 	for (i = init_frame; i < last_frame; i++)
+ 	{
++		if (active_range_count)
++		{
++			while (range_index < active_range_count &&
++			       active_ranges[range_index * 2 + 1] <= i)
++				range_index++;
++			if (range_index >= active_range_count)
++				break;
++			if (i < active_ranges[range_index * 2])
++			{
++				i = active_ranges[range_index * 2] - 1;
++				continue;
++			}
++		}
++
+ 		if (read_frame_avis(in_img, avis_hnd, i))
+ 		{
+ 			fprintf(stderr, "Error reading frame.\n");
+@@ -1341,7 +1457,7 @@
+ 
+ 	/* Give runtime */
+ 	if (0)
+-		fprintf(stderr, "Time elapsed: %lu\n", time(NULL) - bench_start);
++		fprintf(stderr, "Time elapsed: %lld\n", (long long)(time(NULL) - bench_start));
+ 
+ 	return 0;
+ }

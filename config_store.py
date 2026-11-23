@@ -19,13 +19,19 @@ WINDOWS_RESERVED_NAMES = {
 }
 MAX_FOLDER_NAME_LENGTH = 120
 
+LOCAL_APP_DATA = os.environ.get('LOCALAPPDATA') or os.path.expanduser('~')
+APP_DATA_DIR = os.path.join(LOCAL_APP_DATA, 'ohMyAssNoto')
 CONFIG_PATH = os.path.join(os.path.expanduser('~'), 'ohMyAssNoto.json')
-ERROR_LOG_PATH = os.path.join(os.path.expanduser('~'), 'ohMyAssNoto_error.log')
+ERROR_LOG_PATH = os.path.join(APP_DATA_DIR, 'ohMyAssNoto_error.log')
 MAX_LOG_BYTES = 1024 * 1024
 
 
 def log_exception(context: str, exc=None):
-    """把被忽略的异常追加到用户目录日志，超过 1MB 时轮转一次。"""
+    """把被忽略的异常追加到用户数据目录日志，超过 1MB 时轮转一次。"""
+    try:
+        os.makedirs(os.path.dirname(ERROR_LOG_PATH) or '.', exist_ok=True)
+    except OSError:
+        pass
     try:
         if os.path.isfile(ERROR_LOG_PATH) and os.path.getsize(ERROR_LOG_PATH) > MAX_LOG_BYTES:
             os.replace(ERROR_LOG_PATH, ERROR_LOG_PATH + '.1')
@@ -40,6 +46,24 @@ def log_exception(context: str, exc=None):
             handle.write('\n')
     except OSError:
         pass
+
+
+def atomic_write_text(path: str, content: str, encoding: str = 'utf-8-sig') -> None:
+    """先写同目录临时文件再替换，避免中途失败留下半截文件。"""
+    folder = os.path.dirname(os.path.abspath(path)) or '.'
+    os.makedirs(folder, exist_ok=True)
+    handle, temp_path = tempfile.mkstemp(
+        prefix='.oma_write_', suffix='.tmp', dir=folder)
+    try:
+        with os.fdopen(handle, 'w', encoding=encoding, newline='') as stream:
+            stream.write(content)
+        os.replace(temp_path, path)
+    except BaseException:
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+        raise
 
 
 def normalize_display_path(value: str) -> str:
@@ -101,6 +125,44 @@ def save_config(data: dict):
             pass
 
 
+def last_directory(key: str, fallback: str = '') -> str:
+    """返回某个文件选择器上次使用的目录。"""
+    config = load_config()
+    dirs = config.get('last_dirs')
+    if isinstance(dirs, dict):
+        value = str(dirs.get(key) or '').strip()
+        if value and os.path.isdir(value):
+            return value
+    fallback = str(fallback or '').strip()
+    if fallback:
+        if os.path.isdir(fallback):
+            return fallback
+        parent = os.path.dirname(os.path.abspath(fallback))
+        if parent and os.path.isdir(parent):
+            return parent
+    return ''
+
+
+def remember_directory(key: str, path: str):
+    """记住某个文件选择器最后使用的目录。"""
+    text = str(path or '').strip()
+    if not text:
+        return
+    folder = text if os.path.isdir(text) else os.path.dirname(os.path.abspath(text))
+    if not folder or not os.path.isdir(folder):
+        return
+    folder = os.path.abspath(folder)
+    config = load_config()
+    dirs = config.get('last_dirs')
+    if not isinstance(dirs, dict):
+        dirs = {}
+    if dirs.get(key) == folder:
+        return
+    dirs[key] = folder
+    config['last_dirs'] = dirs
+    save_config(config)
+
+
 def cleanup_stale_temp_folders(max_age_seconds: int = 7 * 86400, base: str = None):
     """清理一周前的 PyInstaller 解压目录与更新临时目录。
 
@@ -141,14 +203,13 @@ def cleanup_stale_temp_folders(max_age_seconds: int = 7 * 86400, base: str = Non
 
 
 def write_text_with_fallback(path: str, content: str) -> str:
-    """写入文本；若文件被占用，则改用 name_1.ext 等文件名。"""
+    """原子写入文本；若文件被占用，则改用 name_1.ext 等文件名。"""
     base, ext = os.path.splitext(path)
     candidate = path
     counter = 0
     while True:
         try:
-            with open(candidate, 'w', encoding='utf-8-sig') as f:
-                f.write(content)
+            atomic_write_text(candidate, content)
             return candidate
         except OSError:
             counter += 1

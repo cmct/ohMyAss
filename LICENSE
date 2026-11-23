@@ -23,7 +23,11 @@ SOFTWARE.
 ---
 
 Note: this license covers the original source code of ohMyAss Noto only.
-The third-party binaries under bin/ (AviSynth, VSFilterMod, DevIL,
-avs2bdnxml) are distributed under their own upstream licenses and are NOT
-relicensed under the MIT terms above. See the "外部依赖与许可声明" section of
-README.md for details.
+
+Third-party components under `bin/`, `bin64/`, `third_party/`, and the
+Python packages bundled into the executable are distributed under their own
+upstream licenses. They are NOT relicensed under the MIT terms above.
+
+See `THIRD_PARTY_NOTICES.md` for the component list and licenses, and
+`SOURCE.md` for corresponding-source information and the written source
+offer for GPL components.

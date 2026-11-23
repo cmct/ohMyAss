@@ -1,0 +1,64 @@
+ohMyAss Noto v0.7.0
+===================
+
+文件：ohMyAss Noto.exe
+
+运行环境
+--------
+Windows 10 / 11 x64。
+不需要安装 Python；首次启动会释放内置组件，可能稍慢。
+
+本次重点
+--------
+1. 图形字幕
+   - 只保留 SUPer 链：ASS -> BDN XML + PNG -> SUPer -> SUP / PES + MUI。
+   - 普通字幕直出 SUP 的选项和代码已移除。
+   - 支持同时生成 SUP、PES + MUI。
+   - 新增「SUP 转 PES」：选择已有 .sup，直接生成同名 .pes + .pes.mui，不重新渲染/编码。
+   - x64 的 avs2bdnxml、AviSynth+、VSFilterMod 已内置。
+   - 首次使用 SUPer 时会联网从官方 GitHub Release 下载。
+
+2. 流媒体字幕
+   - 输入 IMDB 编号、片名、Apple TV 或 iTunes 链接。
+   - 默认下载全部 Apple TV 地区、全部语言。
+   - 建议先用：
+       IMDB：tt15398776
+       语言：en,de
+       地区：US,DE,CH,AT
+   - 支持只列出、只查上架、语言/地区筛选、代理、DSID、并发数。
+
+3. 最近文件记录
+   - 文本字幕、图形字幕、黑边检测、问题修复、流媒体字幕的文件选择器会记住上次目录。
+
+注意
+----
+- 流媒体字幕只支持 Apple TV Store / iTunes 购买或租赁的字幕。
+- Apple TV+ 原创、Netflix、Disney+ 等平台，以及剧集，不支持。
+- 下载的字幕仅用于个人备份、学习和字幕研究，请遵守相关服务条款。
+- 如果流媒体页面报错，请把「运行日志」最后 20 行发回来。
+
+版权与许可
+----------
+本项目自身代码使用 MIT License。
+
+bin/、bin64/、third_party/ 下的第三方组件不在 MIT 许可范围内，
+仍遵循各自的上游许可：
+
+- avs2bdnxml x64 修改版：GPL-3.0-or-later
+- AviSynth+ 3.7.6：GPL-2.0
+- VSFilterMod r5.3.1：GPL-3.0
+- zhconv 1.4.3：GPL-2.0-or-later
+- SUPer v0.3.0（运行时下载）：GPL-3.0
+- Pillow：HPND
+- tkinterdnd2 / isubrip / m3u8 等：MIT / BSD 等
+
+完整组件清单、许可证和源码位置见：
+
+- LICENSE
+- THIRD_PARTY_NOTICES.md
+- SOURCE.md
+
+avs2bdnxml 修改版的完整源码在 bin64/source/avs2bdnxml-x64/，
+zhconv 源码在 third_party/zhconv/。
+
+重新分发时请保留上述文件、许可证和对应源码。

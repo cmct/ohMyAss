@@ -7,11 +7,11 @@ import json
 import math
 import mmap
 import shutil
+import struct
 import subprocess
 import tempfile
 import threading
 import time
-from functools import lru_cache
 import xml.etree.ElementTree as ET
 import urllib.parse
 
@@ -22,6 +22,7 @@ from download_utils import (
 )
 from fonts import font_name_installed, installed_font_records
 from subtitle_core import parse_ass_time
+from subtitle_outputs import read_ass_text
 
 
 # ===================== BDN XML / SUP 生成（外部工具，在线更新） =====================
@@ -87,7 +88,7 @@ class RenderCancelled(Exception):
     """用户中止长时间渲染时抛出。"""
 
 
-def _kill_process_tree(process):
+def _kill_process_tree(process, drain: bool = True):
     """终止进程及其子进程，避免管道被孙进程占用导致取消卡住。"""
     if os.name == 'nt':
         try:
@@ -100,10 +101,11 @@ def _kill_process_tree(process):
         process.kill()
     except OSError:
         pass
-    try:
-        process.communicate(timeout=2)
-    except (subprocess.TimeoutExpired, ValueError):
-        pass
+    if drain:
+        try:
+            process.communicate(timeout=2)
+        except (subprocess.TimeoutExpired, ValueError):
+            pass
 
 
 def run_process(args, cwd=None, timeout: int = 3600, cancel_event=None):
@@ -127,6 +129,15 @@ def run_process(args, cwd=None, timeout: int = 3600, cancel_event=None):
                 raise subprocess.TimeoutExpired(args, timeout)
 
 
+_BDN_ARTIFACT_RE = re.compile(
+    r'(?:bdn(?:_\d+)*|\d{8}(?:_\d+)?)\.png$', re.IGNORECASE)
+
+
+def is_bdn_artifact(name: str) -> bool:
+    """判断是否为渲染链生成的 BDN/PNG 中间文件。"""
+    return name == 'bdn.xml' or _BDN_ARTIFACT_RE.fullmatch(name) is not None
+
+
 def cleanup_bdn_outputs(out_dir: str):
     """删除 BDN 渲染产生的中途文件（取消或失败后调用）。"""
     try:
@@ -134,7 +145,7 @@ def cleanup_bdn_outputs(out_dir: str):
     except OSError:
         return
     for name in names:
-        if name == 'bdn.xml' or re.fullmatch(r'\d{8}(?:_\d+)?\.png', name):
+        if is_bdn_artifact(name):
             try:
                 os.remove(os.path.join(out_dir, name))
             except OSError:
@@ -182,9 +193,11 @@ def bdn_tool_exe(name: str) -> str:
 
 def bdn_tool_version_text() -> str:
     parts = []
-    for name in ('ass2bdnxml', 'super'):
+    names = ['super'] if vsfilter_uses_x64() else ['ass2bdnxml', 'super']
+    for name in names:
         state = load_bdn_tool_state(name)
         parts.append(f'{BDN_TOOL_SPECS[name]["label"]} {state.get("tag") or "未安装"}')
+    parts.append(vsfilter_backend_name())
     return ' · '.join(parts)
 
 
@@ -196,7 +209,8 @@ def bdn_tool_installed(name: str) -> bool:
 
 def bdn_tools_status_text() -> str:
     """返回已安装 / 部分安装 / 未安装，用于设置页状态标签。"""
-    names = list(BDN_TOOL_SPECS)
+    # 64 位后端自带 avs2bdnxml，只需要 SUPer；ass2bdnxml 仅在回退 32 位时需要。
+    names = ['super'] if vsfilter_uses_x64() else list(BDN_TOOL_SPECS)
     count = sum(1 for name in names if bdn_tool_installed(name))
     if count == len(names):
         return '已安装'
@@ -509,24 +523,29 @@ def install_bdn_tool(name: str, log=None, force: bool = False):
     return False, detail
 
 
-def install_all_bdn_tools(log=None, force: bool = False):
-    for name in ('ass2bdnxml', 'super'):
+def install_all_bdn_tools(log=None, force: bool = False, names=None):
+    for name in (names or ('ass2bdnxml', 'super')):
         ok, info = install_bdn_tool(name, log, force=force)
         if not ok:
             return False, f'{BDN_TOOL_SPECS[name]["label"]} 安装失败：{info}'
     return True, ''
 
 
-def ensure_bdn_tools(log=None):
+def ensure_bdn_tools(log=None, allow_x64: bool = True):
+    # 64 位后端自带渲染器，不再依赖 32 位 ass2bdnxml；只有回退到旧链时才需要。
+    required = ['super']
+    if not (allow_x64 and vsfilter_uses_x64()):
+        required.insert(0, 'ass2bdnxml')
     missing = [
-        name for name in ('ass2bdnxml', 'super')
+        name for name in required
         if not os.path.isfile(bdn_tool_exe(name))
     ]
     if not missing:
         return True, ''
     if log:
-        log('首次使用需要下载 ass2bdnxml 与 SUPer（约 90 MB）…')
-    return install_all_bdn_tools(log)
+        log('首次使用需要下载 ' + ' 与 '.join(
+            BDN_TOOL_SPECS[name]['label'] for name in required) + '…')
+    return install_all_bdn_tools(log, names=tuple(required))
 
 
 def _normalize_bdn_xml(path: str):
@@ -596,6 +615,28 @@ def build_super_args(params: dict, sup_path: str, make_pes: bool = False):
 
 
 VS_BUNDLE_FILES = ('avs2bdnxml.exe', 'VSFilterMod.dll', 'AviSynth.dll', 'DevIL.dll')
+# 优先使用 64 位 avs2bdnxml + AviSynth+ + VSFilterMod（GDI）；
+# 缺失时回退到旧的 32 位 avs2bdnxml + AviSynth + VSFilterMod 组合。
+VS_RENDER_BUNDLES = (
+    {
+        'arch': 'x64',
+        'label': 'avs2bdnxml',
+        'mode': 'avs2bdnxml',
+        'source_dir': 'bin64',
+        'target_dir': 'vsfilter64',
+        'files': ('avs2bdnxml.exe', 'AviSynth.dll', 'VSFilterMod.dll'),
+        'required': ('avs2bdnxml.exe', 'AviSynth.dll', 'VSFilterMod.dll'),
+    },
+    {
+        'arch': 'x86',
+        'label': 'avs2bdnxml',
+        'mode': 'avs2bdnxml',
+        'source_dir': 'bin',
+        'target_dir': 'vsfilter',
+        'files': VS_BUNDLE_FILES,
+        'required': ('avs2bdnxml.exe', 'VSFilterMod.dll', 'AviSynth.dll'),
+    },
+)
 VS_RENDER_FPS = ('23.976', '24', '25', '29.97', '50', '59.94')
 VS_VIDEO_SIZE = {
     '1080p': (1920, 1080), '1080i': (1920, 1080),
@@ -608,19 +649,25 @@ VS_FPS_EXPR = {
 }
 
 
-def _vsfilter_source(name: str) -> str:
-    """在打包资源根目录或源码目录的 bin 子目录里查找渲染组件。"""
-    for candidate in (resource_path(name), resource_path(os.path.join('bin', name))):
+def _vsfilter_source(name: str, source_dir: str) -> str:
+    """在打包资源根目录或源码目录的 bin/bin64 子目录里查找渲染组件。"""
+    for candidate in (
+            resource_path(os.path.join(source_dir, name)),
+            resource_path(name)):
         if os.path.isfile(candidate):
             return candidate
     return ''
 
 
-def vsfilter_render_dir():
-    """把随包附带的 VSFilterMod 渲染组件释放到工具目录，返回目录（不可用则空串）。"""
-    target = os.path.join(BDN_TOOL_ROOT, 'vsfilter')
-    for name in VS_BUNDLE_FILES:
-        src = _vsfilter_source(name)
+def _prepare_vsfilter_bundle(spec: dict) -> str:
+    """把随包附带的渲染组件释放到独立工具目录，返回目录（不可用则空串）。"""
+    # 必须以随包/源码目录中的组件为准，不能只靠上次释放到 tools 的缓存；
+    # 否则把 bin64 改名后仍会继续走 x64，无法测试回退。
+    if not any(_vsfilter_source(name, spec['source_dir']) for name in spec['required']):
+        return ''
+    target = os.path.join(BDN_TOOL_ROOT, spec['target_dir'])
+    for name in spec['files']:
+        src = _vsfilter_source(name, spec['source_dir'])
         dst = os.path.join(target, name)
         try:
             if not src:
@@ -631,53 +678,51 @@ def vsfilter_render_dir():
             shutil.copy2(src, dst)
         except OSError:
             pass
-    required = ('avs2bdnxml.exe', 'VSFilterMod.dll', 'AviSynth.dll')
-    if all(os.path.isfile(os.path.join(target, name)) for name in required):
+    if spec['arch'] == 'x64':
+        # 清理上一版 vsfmrender 分支残留，避免误用。
+        try:
+            os.remove(os.path.join(target, 'vsfmrender.exe'))
+        except OSError:
+            pass
+    if all(os.path.isfile(os.path.join(target, name)) for name in spec['required']):
         return target
     return ''
 
 
-def vsfilter_available() -> bool:
-    return bool(vsfilter_render_dir())
-
-
-ASS_CACHE_MAX_BYTES = 4 * 1024 * 1024
-
-
-def _decode_ass_file(path: str) -> str:
-    try:
-        with open(path, 'rb') as handle:
-            data = handle.read()
-    except OSError:
-        return ''
-    if data[:2] in (b'\xff\xfe', b'\xfe\xff'):
-        try:
-            return data.decode('utf-16')
-        except UnicodeDecodeError:
-            pass
-    for encoding in ('utf-8-sig', 'gb18030'):
-        try:
-            return data.decode(encoding)
-        except UnicodeDecodeError:
+def _vsfilter_runtime(allow_x64: bool = True):
+    """返回 (backend_spec, runtime_dir)；优先 x64，失败回退 x86。"""
+    for spec in VS_RENDER_BUNDLES:
+        if not allow_x64 and spec['arch'] == 'x64':
             continue
-    return data.decode('cp1252', errors='replace')
+        target = _prepare_vsfilter_bundle(spec)
+        if target:
+            return spec, target
+    return None, ''
 
 
-@lru_cache(maxsize=8)
-def _read_ass_text_cached(path: str, _mtime_ns: int, _size: int) -> str:
-    return _decode_ass_file(path)
+def vsfilter_render_dir(allow_x64: bool = True):
+    """返回当前可用的 VSFilterMod 渲染目录（不可用则空串）。"""
+    _spec, target = _vsfilter_runtime(allow_x64)
+    return target
 
 
-def read_ass_text(path: str) -> str:
-    """按 BOM / UTF-8 / GBK 依次读取 ASS 文本；大文件不进缓存。"""
-    try:
-        stat = os.stat(path)
-    except OSError:
-        return ''
-    if stat.st_size > ASS_CACHE_MAX_BYTES:
-        return _decode_ass_file(os.path.abspath(path))
-    return _read_ass_text_cached(
-        os.path.abspath(path), stat.st_mtime_ns, stat.st_size)
+def vsfilter_uses_x64(allow_x64: bool = True) -> bool:
+    """当前是否会走 64 位渲染后端。"""
+    spec, _target = _vsfilter_runtime(allow_x64)
+    return bool(spec and spec['arch'] == 'x64')
+
+
+def vsfilter_backend_name(allow_x64: bool = True) -> str:
+    """返回当前渲染后端名称，用于界面状态和日志。"""
+    spec, _target = _vsfilter_runtime(allow_x64)
+    if not spec:
+        return '未找到'
+    return f"VSFilterMod {spec['arch']}（{spec['label']}）"
+
+
+def vsfilter_available(allow_x64: bool = True) -> bool:
+    return bool(vsfilter_render_dir(allow_x64))
+
 
 
 def ass_font_names(path: str) -> list:
@@ -716,6 +761,49 @@ def ass_font_names(path: str) -> list:
             continue
         for match in inline_pattern.finditer(parts[9]):
             name = match.group(1).strip().lstrip('@')
+            if name and name not in names:
+                names.append(name)
+    return names
+
+
+def ass_vertical_font_names(path: str) -> list:
+    """提取 ASS 里显式使用 @ 竖排字体的名称（样式 + 行内 \\fn）。"""
+    names = []
+    section = ''
+    fields = None
+    text = read_ass_text(path)
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith('['):
+            section = line.lower()
+            fields = None
+            continue
+        if section in ('[v4+ styles]', '[v4 styles]'):
+            if line.lower().startswith('format:'):
+                fields = [item.strip().lower()
+                          for item in line.split(':', 1)[1].split(',')]
+                continue
+            if (not line.lower().startswith('style:') or not fields
+                    or 'fontname' not in fields):
+                continue
+            values = line.split(':', 1)[1].split(',')
+            index = fields.index('fontname')
+            if index >= len(values):
+                continue
+            name = values[index].strip()
+            if name.startswith('@'):
+                if name not in names:
+                    names.append(name)
+            continue
+        if section != '[events]':
+            continue
+        if not line.lower().startswith('dialogue:'):
+            continue
+        parts = line.split(',', 9)
+        if len(parts) < 10:
+            continue
+        for match in re.finditer(r'\\fn\s*(@[^\\}]*)', parts[9], re.I):
+            name = match.group(1).strip()
             if name and name not in names:
                 names.append(name)
     return names
@@ -770,6 +858,60 @@ def _merge_intervals(intervals):
         else:
             merged.append((start, end))
     return merged
+
+
+_ANIMATED_TAG_RE = re.compile(
+    r'\\(?:t|move|k|kf|ko|kt|fad|fade|rnd)\b', re.IGNORECASE)
+
+
+def _ass_render_ranges(ass_path: str, fps_value: float, frames: int):
+    """返回需要交给 VSFilterMod 的帧区间。
+
+    静态事件只保留开始/结束边界；带 \t、\move、\k、\fad、\rnd 等
+    时间动画的事件保留完整区间。
+    """
+    ranges = []
+    for line in read_ass_text(ass_path).splitlines():
+        if not line.startswith('Dialogue:'):
+            continue
+        parts = line.split(',', 9)
+        if len(parts) < 10:
+            continue
+        start_ms = parse_ass_time(parts[1])
+        end_ms = parse_ass_time(parts[2])
+        if start_ms is None or end_ms is None or end_ms <= start_ms:
+            continue
+        start = max(0, int(math.ceil(start_ms / 1000.0 * fps_value)))
+        end = min(frames, max(start + 1,
+                              int(math.ceil(end_ms / 1000.0 * fps_value))))
+        if _ANIMATED_TAG_RE.search(parts[9]):
+            if end > start:
+                ranges.append((max(0, start - 1), min(frames, end + 2)))
+        else:
+            ranges.append((max(0, start - 1), min(frames, start + 2)))
+            if end < frames:
+                ranges.append((max(0, end - 1), min(frames, end + 2)))
+            elif frames > 0:
+                ranges.append((max(0, frames - 2), frames))
+    if not ranges:
+        return []
+    return _merge_intervals(ranges)
+
+
+def _write_active_ranges(work: str, ass_path: str,
+                         fps_value: float, frames: int) -> str:
+    """把需要渲染的帧区间写成 avs2bdnxml 的 active-ranges 文件。"""
+    ranges = _ass_render_ranges(ass_path, fps_value, frames)
+    if not ranges:
+        return ''
+    path = os.path.join(work, 'active.txt')
+    try:
+        with open(path, 'w', encoding='ascii', newline='\n') as handle:
+            for start, end in ranges:
+                handle.write(f'{start} {end}\n')
+    except OSError:
+        return ''
+    return 'active.txt'
 
 
 def _vsfilter_segments(intervals, fps_value, first_frame, last_frame, parts, min_frames):
@@ -857,15 +999,18 @@ def _merge_bdn_parts(xml_paths, out_path):
 
 def render_bdn_with_vsfilter(ass_path: str, out_dir: str, fmt: str, fps: str,
                              language: str, track_name: str,
-                             log=None, progress=None, cancel_event=None):
-    """用 avs2bdnxml + VSFilterMod 渲染 BDN XML + PNG（支持 \\fsvp 等 Mod 标签）。"""
+                             log=None, progress=None, cancel_event=None,
+                             allow_x64: bool = True):
+    """用 VSFilterMod 渲染 BDN XML + PNG（优先 x64，支持 \\fsvp 等 Mod 标签）。"""
     def report(value):
         if progress:
             progress(value)
 
-    runtime = vsfilter_render_dir()
+    spec, runtime = _vsfilter_runtime(allow_x64)
     if not runtime:
-        return False, '未找到 VSFilterMod 渲染组件（avs2bdnxml / VSFilterMod.dll）'
+        return False, (
+            '未找到 VSFilterMod 渲染组件（bin64\\avs2bdnxml.exe / '
+            'AviSynth.dll / VSFilterMod.dll，或 32 位 bin 回退）')
     if cancel_event is not None and cancel_event.is_set():
         raise RenderCancelled('已取消')
     width, height = VS_VIDEO_SIZE.get(fmt, (1920, 1080))
@@ -922,6 +1067,7 @@ def render_bdn_with_vsfilter(ass_path: str, out_dir: str, fmt: str, fps: str,
         except OSError as exc:
             return False, '读取 ASS 失败：' + str(exc)
 
+        title = track_name.strip() or 'Undefined'
         fps_expr = VS_FPS_EXPR.get(str(fps), str(fps))
         script = (
             'LoadPlugin("..\\VSFilterMod.dll")\n'
@@ -938,12 +1084,17 @@ def render_bdn_with_vsfilter(ass_path: str, out_dir: str, fmt: str, fps: str,
             return False, '写入渲染脚本失败：' + str(exc)
 
         exe = os.path.join(runtime, 'avs2bdnxml.exe')
+        active_args = []
+        if spec['arch'] == 'x64':
+            active_name = _write_active_ranges(work, ass_path, fps_value, frames)
+            if active_name:
+                active_args = ['-R', active_name]
         base_args = [
             exe, '-o', 'bdn.xml',
             '-v', fmt, '-f', str(fps), '-l', language or 'und',
-            '-t', (track_name.strip() or 'Undefined'),
+            '-t', title,
             '-a', '1', '-p', '0', '-e', '0',
-        ]
+        ] + active_args
 
         def segment_args(index, start, count, single=False):
             args = base_args[:]
@@ -971,7 +1122,7 @@ def render_bdn_with_vsfilter(ass_path: str, out_dir: str, fmt: str, fps: str,
 
         def render_single():
             if log:
-                log('正在用 VSFilterMod 渲染字幕帧…')
+                log(f"正在用 VSFilterMod {spec['arch']} 渲染字幕帧…")
             result = run_args(segment_args(0, first_frame, frames - first_frame, single=True))
             if isinstance(result, Exception):
                 return False, 'VSFilterMod 渲染失败：' + str(result)
@@ -983,7 +1134,7 @@ def render_bdn_with_vsfilter(ass_path: str, out_dir: str, fmt: str, fps: str,
         rendered = False
         if len(segments) > 1:
             if log:
-                log(f'正在用 VSFilterMod 并行渲染字幕帧（{len(segments)} 段）…')
+                log(f"正在用 VSFilterMod {spec['arch']} 并行渲染字幕帧（{len(segments)} 段）…")
             lock = threading.Lock()
             errors = []
             cancelled = threading.Event()
@@ -1038,7 +1189,7 @@ def render_bdn_with_vsfilter(ass_path: str, out_dir: str, fmt: str, fps: str,
         monitor_stop.set()
         os.makedirs(out_dir, exist_ok=True)
         for name in os.listdir(work):
-            if name == 'bdn.xml' or re.fullmatch(r'\d{8}_\d+\.png', name):
+            if is_bdn_artifact(name):
                 src = os.path.join(work, name)
                 dst = os.path.join(out_dir, name)
                 if os.path.exists(dst):
@@ -1055,11 +1206,111 @@ def render_bdn_with_vsfilter(ass_path: str, out_dir: str, fmt: str, fps: str,
         shutil.rmtree(work, ignore_errors=True)
 
 
+PGS_SEGMENT_TYPES = (0x14, 0x15, 0x16, 0x17, 0x80)
+PES_MUX_OFFSET = 54000000
+_PGS_W32 = 0xFFFFFFFF
+_PGS_W33 = 0x1FFFFFFFF
+_PGS_W39 = 0x7FFFFFFFFF
+_PGS_WRAP_MARGIN = 900000
+
+
+def _sup_timestamp(value: int, index: int) -> int:
+    """把 SUP 里靠近 32 位回绕点的负 DTS/PTS 还原成负值。"""
+    if index < 10 and value > _PGS_W32 - _PGS_WRAP_MARGIN:
+        return value - 0x100000000
+    return value
+
+
+def sup_to_pes(sup_path: str, out_dir: str = '', log=None, progress=None,
+               cancel_event=None):
+    """把已有 SUP/PGS 直接封装为 PES + MUI，不重新渲染或编码。"""
+    source = os.path.abspath(sup_path)
+    if not os.path.isfile(source):
+        return False, '找不到 SUP 文件', []
+    target_dir = os.path.abspath(out_dir) if out_dir else os.path.dirname(source)
+    try:
+        os.makedirs(target_dir, exist_ok=True)
+    except OSError as exc:
+        return False, f'无法创建输出目录：{exc}', []
+    stem = os.path.splitext(os.path.basename(source))[0]
+    pes_path = os.path.join(target_dir, stem + '.pes')
+    mui_path = os.path.join(target_dir, stem + '.pes.mui')
+    tmp_pes = pes_path + '.tmp'
+    tmp_mui = mui_path + '.tmp'
+    total = os.path.getsize(source)
+    segment_count = 0
+    has_pcs = False
+    try:
+        with open(source, 'rb') as src, \
+                open(tmp_pes, 'wb') as pes, open(tmp_mui, 'wb') as mui:
+            mui.write(b'\x00\x00\x00\x03')
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise RenderCancelled('已取消')
+                header = src.read(13)
+                if not header:
+                    break
+                if len(header) < 13:
+                    raise ValueError('SUP 文件结尾不完整')
+                if header[:2] != b'PG':
+                    raise ValueError(
+                        f'SUP 段头无效（偏移 {src.tell() - len(header)}）')
+                pts, dts, seg_type, length = struct.unpack('>IIBH', header[2:])
+                if seg_type not in PGS_SEGMENT_TYPES:
+                    raise ValueError(f'未知 PGS 段类型：0x{seg_type:02X}')
+                payload = src.read(length)
+                if len(payload) != length:
+                    raise ValueError('SUP 段数据不完整')
+                pts = _sup_timestamp(pts, segment_count)
+                dts = _sup_timestamp(dts, segment_count)
+                mux_pts = (PES_MUX_OFFSET + pts) & _PGS_W33
+                mux_dts = (PES_MUX_OFFSET + dts) & _PGS_W33
+                mui.write(struct.pack('>BI', seg_type, length + 3))
+                meta = bytearray(9)
+                meta[:4] = struct.pack('>I', (mux_dts >> 1) & _PGS_W32)
+                meta[4:9] = struct.pack('>Q', (mux_pts << 6) & _PGS_W39)[3:]
+                meta[4] |= ((mux_dts & 1) << 7)
+                mui.write(meta)
+                pes.write(struct.pack('>BH', seg_type, length))
+                pes.write(payload)
+                segment_count += 1
+                if seg_type == 0x16:
+                    has_pcs = True
+                if progress and total:
+                    progress(min(99.0, src.tell() * 100.0 / total))
+            mui.write(b'\xFF' + bytes(13))
+        if not segment_count or not has_pcs:
+            raise ValueError('SUP 中没有有效的 PGS 显示集')
+        os.replace(tmp_pes, pes_path)
+        os.replace(tmp_mui, mui_path)
+    except RenderCancelled:
+        for path in (tmp_pes, tmp_mui):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        raise
+    except Exception as exc:
+        for path in (tmp_pes, tmp_mui):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        return False, str(exc), []
+    if progress:
+        progress(100)
+    if log:
+        log(f'SUP 转 PES：{os.path.basename(source)} -> '
+            f'{os.path.basename(pes_path)} / {os.path.basename(mui_path)}')
+    return True, '', [pes_path, mui_path]
+
+
 def generate_bdn_sup(ass_path: str, out_dir: str, fmt: str = '1080p', fps: str = '23.976',
                      language: str = 'chi', track_name: str = '',
                      make_sup: bool = True, make_pes: bool = False,
-                     params: dict = None, log=None, progress=None, cancel_event=None):
-    """严格用 VSFilterMod 渲染 BDN XML，再用 SUPer 生成 SUP / PES+MUI。"""
+                     params: dict = None, log=None, progress=None, cancel_event=None,
+                     allow_x64: bool = True):
+    """SUPer 链：渲染 BDN XML + PNG，再交给 SUPer 生成 SUP / PES。"""
     def report(value):
         if progress:
             progress(value)
@@ -1070,33 +1321,36 @@ def generate_bdn_sup(ass_path: str, out_dir: str, fmt: str = '1080p', fps: str =
         return False, combo_message, []
     if cancel_event is not None and cancel_event.is_set():
         raise RenderCancelled('已取消')
-    ok, info = ensure_bdn_tools(log)
-    if not ok:
-        return False, info, []
     if not os.path.isfile(ass_path):
         return False, '找不到 ASS 字幕文件', []
-    if cancel_event is not None and cancel_event.is_set():
-        raise RenderCancelled('已取消')
+    if str(fps) not in VS_RENDER_FPS:
+        return False, f'VSFilterMod 不支持该帧率：{fps}', []
+
     os.makedirs(out_dir, exist_ok=True)
     report(10)
-
     for name in os.listdir(out_dir):
-        if name == 'bdn.xml' or re.fullmatch(r'\d{8}(?:_\d+)?\.png', name):
+        if is_bdn_artifact(name):
             try:
                 os.remove(os.path.join(out_dir, name))
             except OSError:
                 pass
 
-    bdn_path = os.path.join(out_dir, 'bdn.xml')
-    if str(fps) not in VS_RENDER_FPS:
-        return False, f'VSFilterMod 不支持该帧率：{fps}', []
-    if not vsfilter_available():
+    if not vsfilter_available(allow_x64=allow_x64):
         return False, (
-            '未找到 VSFilterMod 渲染组件（avs2bdnxml / VSFilterMod.dll）。\n'
-            '本软件只支持 VSFilterMod 渲染，请先重新安装工具或检查程序目录。'), []
+            '未找到 VSFilterMod 渲染组件（bin64\\avs2bdnxml.exe / '
+            'AviSynth.dll / VSFilterMod.dll，或 32 位 bin 回退）。\n'
+            '请检查程序目录是否完整。'), []
+
+    if make_sup or make_pes:
+        ok, info = ensure_bdn_tools(log, allow_x64=allow_x64)
+        if not ok:
+            return False, info, []
+
+    bdn_path = os.path.join(out_dir, 'bdn.xml')
     ok, message = render_bdn_with_vsfilter(
         ass_path, out_dir, fmt, str(fps), language, track_name,
-        log=log, progress=progress, cancel_event=cancel_event)
+        log=log, progress=progress, cancel_event=cancel_event,
+        allow_x64=allow_x64)
     if not ok:
         return False, message, []
     _normalize_bdn_xml(bdn_path)
@@ -1195,7 +1449,7 @@ def validate_bdn_sup(ass_path: str, out_dir: str, make_sup: bool = True,
             if ass_end and info['last_ms'] + 500 < ass_end:
                 issues.append('BDN 末事件早于字幕结束时间，可能漏渲')
 
-    if make_sup:
+    if make_sup or make_pes:
         stem = os.path.splitext(os.path.basename(ass_path))[0]
         sup_path = os.path.join(out_dir, stem + '.sup')
         if not os.path.isfile(sup_path):

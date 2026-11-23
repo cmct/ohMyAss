@@ -54,6 +54,29 @@ class TimeTests(unittest.TestCase):
         self.assertIn('Dialogue: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,Hi', result)
 
 
+class TimelineGapTests(unittest.TestCase):
+    def test_gap_reports_previous_event(self):
+        sub = core.Aegisub('')
+        sub.timeline_events = [
+            {'index': 17, 'start': 0, 'end': 1000, 'align': 2},
+            {'index': 18, 'start': 1100, 'end': 2000, 'align': 2},
+        ]
+        sub.check_timeline_gaps()
+        self.assertEqual(len(sub.notices), 1)
+        self.assertTrue(sub.notices[0].startswith('17,'))
+        self.assertIn('下一条(18)', sub.notices[0])
+        self.assertIn('200ms', sub.notices[0])
+
+    def test_gap_skips_top8_bottom2_pair(self):
+        sub = core.Aegisub('')
+        sub.timeline_events = [
+            {'index': 3, 'start': 0, 'end': 1000, 'align': 2},
+            {'index': 4, 'start': 1100, 'end': 2000, 'align': 8},
+        ]
+        sub.check_timeline_gaps()
+        self.assertEqual(sub.notices, [])
+
+
 class StyleTests(unittest.TestCase):
     def test_default_style_lines_are_complete(self):
         for kind, _label in core.STYLE_CATEGORIES:
@@ -296,6 +319,33 @@ class FontTests(unittest.TestCase):
             self.assertEqual(
                 bdn_sup.ass_font_names(path),
                 ['样式字体', '行内字体', '竖排字体'])
+
+    def test_ass_vertical_font_names_detects_styles_and_inline(self):
+        import bdn_sup
+
+        content = (
+            '[Script Info]\n'
+            'ScriptType: v4.00+\n'
+            '[V4+ Styles]\n'
+            'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, '
+            'OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, '
+            'ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, '
+            'Alignment, MarginL, MarginR, MarginV, Encoding\n'
+            'Style: Default,@SimSun,80,&H00EAEAEA,&HF0000000,&H000D0500,'
+            '&H00000000,0,0,0,0,100,100,0,0,1,2,0,2,0,0,14,1\n'
+            '[Events]\n'
+            'Format: Layer, Start, End, Style, Name, MarginL, MarginR, '
+            'MarginV, Effect, Text\n'
+            'Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,'
+            '{\\fn@Source Han Sans}测试\n'
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, 'vertical.ass')
+            with open(path, 'w', encoding='utf-8-sig') as handle:
+                handle.write(content)
+            self.assertEqual(
+                bdn_sup.ass_vertical_font_names(path),
+                ['@SimSun', '@Source Han Sans'])
 
 
 class UpdateScriptTests(unittest.TestCase):

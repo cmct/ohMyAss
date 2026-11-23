@@ -5,7 +5,7 @@ import re
 import sys
 
 APP_NAME = 'ohMyAss Noto'
-APP_VERSION = 'v0.6.1'
+APP_VERSION = 'v0.7.0'
 
 
 def resource_path(relative_path: str) -> str:

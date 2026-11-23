@@ -97,6 +97,48 @@ def _font_key(name: str) -> str:
     return re.sub(r'[^0-9a-z\u4e00-\u9fff]+', '', text.lower())
 
 
+# Windows 注册表常用英文族名，ASS 里常用中文族名；两边视为同一字体。
+FONT_NAME_PAIRS = (
+    ('宋体', 'SimSun'),
+    ('新宋体', 'NSimSun'),
+    ('黑体', 'SimHei'),
+    ('微软雅黑', 'Microsoft YaHei'),
+    ('微软雅黑 UI', 'Microsoft YaHei UI'),
+    ('楷体', 'KaiTi'),
+    ('仿宋', 'FangSong'),
+    ('等线', 'DengXian'),
+    ('幼圆', 'YouYuan'),
+    ('隶书', 'LiSu'),
+    ('华文细黑', 'STXihei'),
+    ('华文黑体', 'STHeiti'),
+    ('华文楷体', 'STKaiti'),
+    ('华文宋体', 'STSong'),
+    ('华文仿宋', 'STFangsong'),
+    ('华文中宋', 'STZhongsong'),
+    ('华文彩云', 'STCaiyun'),
+    ('华文琥珀', 'STHupo'),
+    ('华文隶书', 'STLiti'),
+    ('华文行楷', 'STXingkai'),
+    ('华文新魏', 'STXinwei'),
+)
+FONT_NAME_ALIASES = {}
+for _zh_name, _en_name in FONT_NAME_PAIRS:
+    _zh_key = _font_key(_zh_name)
+    _en_key = _font_key(_en_name)
+    FONT_NAME_ALIASES[_zh_key] = _en_key
+    FONT_NAME_ALIASES[_en_key] = _zh_key
+
+
+def _font_bases(name: str):
+    """返回 (基础名候选集合, 字重集合)。"""
+    base, weights = _font_tokens(name)
+    bases = {base} if base else set()
+    alias = FONT_NAME_ALIASES.get(base)
+    if alias:
+        bases.add(alias)
+    return bases, weights
+
+
 def _font_aliases(name: str) -> list:
     """拆分「Microsoft YaHei & Microsoft YaHei UI」这类共用注册项。"""
     text = re.sub(r'\([^)]*\)', ' ', str(name or ''))
@@ -135,6 +177,82 @@ def _resolve_font_file(value: str) -> str:
     return ''
 
 
+def _gdi_font_faces():
+    """用 GDI 枚举系统字体族名，补全注册表里只有英文名的本地化名称。"""
+    if os.name != 'nt':
+        return ()
+    try:
+        from ctypes import wintypes
+        gdi32 = ctypes.windll.gdi32
+        user32 = ctypes.windll.user32
+    except Exception:
+        return ()
+
+    class LOGFONTW(ctypes.Structure):
+        _fields_ = [
+            ('lfHeight', wintypes.LONG),
+            ('lfWidth', wintypes.LONG),
+            ('lfEscapement', wintypes.LONG),
+            ('lfOrientation', wintypes.LONG),
+            ('lfWeight', wintypes.LONG),
+            ('lfItalic', wintypes.BYTE),
+            ('lfUnderline', wintypes.BYTE),
+            ('lfStrikeOut', wintypes.BYTE),
+            ('lfCharSet', wintypes.BYTE),
+            ('lfOutPrecision', wintypes.BYTE),
+            ('lfClipPrecision', wintypes.BYTE),
+            ('lfQuality', wintypes.BYTE),
+            ('lfPitchAndFamily', wintypes.BYTE),
+            ('lfFaceName', wintypes.WCHAR * 32),
+        ]
+
+    class ENUMLOGFONTEXW(ctypes.Structure):
+        _fields_ = [
+            ('elfLogFont', LOGFONTW),
+            ('elfFullName', wintypes.WCHAR * 64),
+            ('elfStyle', wintypes.WCHAR * 32),
+            ('elfScript', wintypes.WCHAR * 32),
+        ]
+
+    enum_proc = ctypes.WINFUNCTYPE(
+        ctypes.c_int, ctypes.POINTER(ENUMLOGFONTEXW),
+        ctypes.c_void_p, wintypes.DWORD, wintypes.LPARAM)
+
+    user32.GetDC.argtypes = [wintypes.HWND]
+    user32.GetDC.restype = wintypes.HDC
+    user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
+    user32.ReleaseDC.restype = ctypes.c_int
+    gdi32.EnumFontFamiliesExW.argtypes = [
+        wintypes.HDC, ctypes.POINTER(LOGFONTW), enum_proc,
+        wintypes.LPARAM, wintypes.DWORD,
+    ]
+    gdi32.EnumFontFamiliesExW.restype = ctypes.c_int
+
+    hdc = user32.GetDC(None)
+    if not hdc:
+        return ()
+    faces = []
+
+    @enum_proc
+    def callback(lpelfe, _lpntme, _fonttype, _lparam):
+        entry = lpelfe.contents
+        face = str(entry.elfLogFont.lfFaceName).strip()
+        if face.startswith('@'):
+            face = face[1:]
+        if face:
+            faces.append((face, str(entry.elfFullName).strip()))
+        return 1
+
+    logfont = LOGFONTW()
+    logfont.lfCharSet = 1  # DEFAULT_CHARSET
+    try:
+        gdi32.EnumFontFamiliesExW(
+            hdc, ctypes.byref(logfont), callback, 0, 0)
+    finally:
+        user32.ReleaseDC(None, hdc)
+    return tuple(faces)
+
+
 @lru_cache(maxsize=1)
 def installed_font_records():
     """已安装字体记录：((基础名, 字重集合, 文件路径), ...)。"""
@@ -154,6 +272,17 @@ def installed_font_records():
         for alias in _font_aliases(name):
             base, weights = _font_tokens(alias)
             add(base, weights, path)
+    # 注册表里 SimSun 等字体只登记英文名，ASS 常用「宋体」等本地化名。
+    # GDI 枚举能拿到系统实际使用的字体族名，避免把已安装字体误报为缺失。
+    path_by_base = {base: path for base, _weights, path in records if path}
+    for face, full_name in _gdi_font_faces():
+        base, weights = _font_tokens(face)
+        path = path_by_base.get(base, '')
+        if not path:
+            path = path_by_base.get(_font_key(full_name), '')
+        if not path:
+            path = path_by_base.get(FONT_NAME_ALIASES.get(base, ''), '')
+        add(base, weights, path)
     for folder in (os.path.join(os.environ.get('WINDIR', r'C:\Windows'), 'Fonts'),
                    USER_FONT_DIR):
         try:
@@ -171,22 +300,22 @@ def installed_font_records():
 
 def font_name_installed(name: str, records=None) -> bool:
     """严格判断字体名是否已安装：基础名相同且字重完全对应。"""
-    base, weights = _font_tokens(name)
-    if not base:
+    bases, weights = _font_bases(name)
+    if not bases:
         return True
     records = installed_font_records() if records is None else records
     for record_base, record_weights, _ in records:
-        if record_base == base and weights <= record_weights:
+        if record_base in bases and weights <= record_weights:
             return True
     return False
 
 
 def preview_font_path(name: str) -> str:
     """给样式预览挑一个可用的字体文件（字重优先精确匹配）。"""
-    base, weights = _font_tokens(name)
+    bases, weights = _font_bases(name)
     fallback = ''
     for record_base, record_weights, path in installed_font_records():
-        if record_base != base or not path or not os.path.isfile(path):
+        if record_base not in bases or not path or not os.path.isfile(path):
             continue
         if weights <= record_weights:
             return path

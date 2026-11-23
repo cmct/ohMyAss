@@ -1,6 +1,7 @@
 """主题令牌、DPI、字体、图标与通用 Tk 控件。"""
 
 
+import json
 import os
 import sys
 import ctypes
@@ -211,7 +212,7 @@ def theme_fg_map(old_dark: bool, new_dark: bool) -> dict:
     return mapping
 
 
-BG_OPTIONS = ('bg', 'background', 'activebackground', 'selectbackground',
+BG_OPTIONS = ('bg', 'background', 'activebackground', 'selectbackground', 'highlightcolor',
               'troughcolor', 'selectcolor', 'highlightbackground',
               'readonlybackground', 'disabledbackground')
 FG_OPTIONS = ('fg', 'foreground', 'activeforeground', 'selectforeground',
@@ -289,8 +290,63 @@ UI_SCALE = 1.0
 CURRENT_DARK_THEME = False
 
 
+class _POINT(ctypes.Structure if sys.platform == 'win32' else object):
+    _fields_ = [('x', ctypes.c_long), ('y', ctypes.c_long)]
+
+
+def _saved_window_point():
+    """读取上次窗口位置，用于按所在显示器计算启动缩放。"""
+    try:
+        with open(os.path.join(os.path.expanduser('~'), 'ohMyAssNoto.json'),
+                  'r', encoding='utf-8') as handle:
+            data = json.load(handle)
+        return int(data['window_x']), int(data['window_y'])
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+
+
+def _monitor_dpi_handle(monitor):
+    try:
+        dpi_x = ctypes.c_uint()
+        dpi_y = ctypes.c_uint()
+        if ctypes.windll.shcore.GetDpiForMonitor(
+                monitor, 0, ctypes.byref(dpi_x), ctypes.byref(dpi_y)) == 0:
+            return int(dpi_x.value)
+    except (OSError, AttributeError, ValueError):
+        pass
+    return 0
+
+
+def monitor_dpi_for_point(x, y):
+    if sys.platform != 'win32':
+        return 0
+    try:
+        user32 = ctypes.windll.user32
+        user32.MonitorFromPoint.restype = ctypes.c_void_p
+        monitor = user32.MonitorFromPoint(_POINT(int(x), int(y)), 2)
+        return _monitor_dpi_handle(monitor)
+    except (OSError, AttributeError, ValueError, TypeError):
+        return 0
+
+
+def monitor_dpi_for_window(hwnd):
+    if sys.platform != 'win32' or not hwnd:
+        return 0
+    try:
+        user32 = ctypes.windll.user32
+        user32.MonitorFromWindow.restype = ctypes.c_void_p
+        monitor = user32.MonitorFromWindow(int(hwnd), 2)
+        return _monitor_dpi_handle(monitor)
+    except (OSError, AttributeError, ValueError, TypeError):
+        return 0
+
+
 def enable_dpi_awareness():
-    """开启 Windows DPI 感知并计算界面缩放比例。"""
+    """开启 Windows DPI 感知并计算界面缩放比例。
+
+    启动时优先按上次窗口所在的显示器计算缩放；运行时移动到不同缩放的
+    显示器后，Tk 8.6 无法重新排布已创建控件，界面会提示重启。
+    """
     global UI_SCALE
     if sys.platform != 'win32':
         return
@@ -301,10 +357,15 @@ def enable_dpi_awareness():
             ctypes.windll.user32.SetProcessDPIAware()
         except (OSError, AttributeError):
             pass
-    try:
-        dpi = int(ctypes.windll.user32.GetDpiForSystem())
-    except (OSError, AttributeError, ValueError):
-        dpi = 96
+    dpi = 0
+    point = _saved_window_point()
+    if point is not None:
+        dpi = monitor_dpi_for_point(*point)
+    if not dpi:
+        try:
+            dpi = int(ctypes.windll.user32.GetDpiForSystem())
+        except (OSError, AttributeError, ValueError):
+            dpi = 96
     UI_SCALE = max(1.0, dpi / 96.0)
     try:
         screen_w = int(ctypes.windll.user32.GetSystemMetrics(0))
@@ -328,6 +389,7 @@ enable_dpi_awareness()
 ICON_HOME = '\uE80F'
 ICON_PENCIL = '\uE70F'
 ICON_VIDEO = '\uE714'
+ICON_TV = '\uE333'
 ICON_FIX = '\uE90F'
 ICON_SETTINGS = '\uE713'
 ICON_GLOSSARY = '\uE8FD'
@@ -379,8 +441,12 @@ def center_window(window, parent):
 class RoundedFrame(tk.Frame):
     """Canvas 绘制的圆角容器，内容放在 .body 中。"""
 
-    def __init__(self, parent, radius=8, bg=UI_BG, fill=UI_CARD,
-                 border=UI_BORDER, inset=4):
+    def __init__(self, parent, radius=8, bg=None, fill=None,
+                 border=None, inset=4):
+        # 颜色不能在默认参数里取：那是导入时的浅色值，懒加载页面会用到旧颜色
+        bg = UI_BG if bg is None else bg
+        fill = UI_CARD if fill is None else fill
+        border = UI_BORDER if border is None else border
         super().__init__(parent, bg=bg)
         self.radius = px(radius)
         self.fill = fill
@@ -557,6 +623,41 @@ def render_camera_icon(size: int = 34, color=(32, 41, 56), weight: float = 1.0):
     right, bottom = point(20 + lens, 23.5 + lens)
     draw.ellipse((left, top, right, bottom), outline=line_color, width=width)
 
+    return _normalize_icon(image, size)
+
+
+def render_tv_icon(size: int = 34, color=(32, 41, 56), weight: float = 1.0):
+    """用 PIL 生成抗锯齿的简笔画小电视图标。"""
+    if Image is None or ImageDraw is None:
+        return None
+    scale = 4
+    canvas = size * scale
+    unit = canvas / 40.0
+    image = Image.new('RGBA', (canvas, canvas), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    line_color = color + (255,)
+    width = max(2, round(2.05 * unit * weight))
+
+    def point(x, y):
+        return (x * unit, y * unit)
+
+    # 电视外框
+    left, top = point(5, 9)
+    right, bottom = point(35, 29)
+    draw.rounded_rectangle(
+        (left, top, right, bottom), radius=3 * unit,
+        outline=line_color, width=width)
+    # 屏幕内框，让图标更像电视
+    left, top = point(9, 13)
+    right, bottom = point(31, 25)
+    draw.rounded_rectangle(
+        (left, top, right, bottom), radius=1.5 * unit,
+        outline=line_color, width=max(1, round(width * 0.7)))
+    # 底座
+    draw.line([point(20, 29), point(20, 33)],
+              fill=line_color, width=width)
+    draw.line([point(14, 34), point(26, 34)],
+              fill=line_color, width=width, joint='curve')
     return _normalize_icon(image, size)
 
 
@@ -792,6 +893,7 @@ ICON_RENDERERS = {
     'pencil': render_pencil_icon,
     'fix': render_wrench_icon,
     'frame': render_camera_icon,
+    'tv': render_tv_icon,
     'settings': render_gear_icon,
 }
 

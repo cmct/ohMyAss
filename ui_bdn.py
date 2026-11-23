@@ -9,7 +9,10 @@ import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from config_store import load_config, log_exception, normalize_display_path, save_config
+from config_store import (
+    last_directory, load_config, log_exception, normalize_display_path,
+    remember_directory, save_config,
+)
 
 import theme_ui
 from theme_ui import (
@@ -23,7 +26,8 @@ from theme_ui import (
 from bdn_sup import (
     BDN_FORMATS, BDN_FORMAT_FPS, BDN_FPS, BDN_PARAM_DEFAULTS,
     BDN_PARAM_HELP, BDN_QUANTIZERS, RenderCancelled, cleanup_bdn_outputs,
-    generate_bdn_sup, missing_ass_fonts, validate_bdn_format, validate_bdn_sup,
+    ass_vertical_font_names, generate_bdn_sup, missing_ass_fonts,
+    sup_to_pes, validate_bdn_format, validate_bdn_sup,
     vsfilter_available,
 )
 from ui_widgets import attach_entry_placeholder, enable_file_drop, split_dropped_paths
@@ -230,7 +234,8 @@ class QueueList(tk.Frame):
         self.header_canvas.grid(row=0, column=0, sticky='ew')
         self.canvas = tk.Canvas(
             body, height=self.ROW_HEIGHT * self.VISIBLE_ROWS, bg=UI_FIELD,
-            highlightthickness=1, highlightbackground=UI_FIELD_BORDER, bd=0)
+            highlightthickness=px(1), highlightbackground=UI_FIELD_BORDER,
+            highlightcolor=UI_ACCENT, takefocus=1, bd=0)
         self.canvas.grid(row=1, column=0, sticky='nsew')
         self.scrollbar = ttk.Scrollbar(
             body, orient='vertical', command=self._on_scroll)
@@ -238,6 +243,8 @@ class QueueList(tk.Frame):
         self.header_canvas.bind('<Configure>', lambda event: self._draw_header())
         self.canvas.bind('<Configure>', lambda event: self.redraw())
         self.canvas.bind('<Button-1>', self._on_click)
+        self.canvas.bind(
+            '<Button-1>', lambda event: self.canvas.focus_set(), add='+')
         self.canvas.bind('<MouseWheel>', self._on_wheel)
         self.canvas.bind('<Delete>', lambda event: self.remove_selected())
         self.canvas.bind('<Control-a>', lambda event: self.select_all())
@@ -476,6 +483,23 @@ class QueueList(tk.Frame):
         self._sync_scroll()
 
 
+def build_output_dirs(paths, out_root=''):
+    """为每个 ASS 计算输出文件夹；不同目录下的同名文件自动加序号。"""
+    jobs = []
+    used = set()
+    for path in paths:
+        base = out_root or os.path.dirname(os.path.abspath(path))
+        stem = os.path.splitext(os.path.basename(path))[0]
+        out_dir = os.path.join(base, stem + '_BDN')
+        counter = 2
+        while out_dir.casefold() in used:
+            out_dir = os.path.join(base, f'{stem}_{counter}_BDN')
+            counter += 1
+        used.add(out_dir.casefold())
+        jobs.append((path, out_dir))
+    return jobs
+
+
 class BdnSupPanel(ttk.Frame):
     """SUP 生成页：调用 ass2bdnxml + SUPer，工具在线更新。"""
 
@@ -505,7 +529,7 @@ class BdnSupPanel(ttk.Frame):
     def build_ui(self):
         create_hero(
             self, '图形字幕',
-            '由 ASS 生成 BDN XML + PNG，并编码 SUP、PES + MUI。',
+            '由 ASS 生成 BDN XML + PNG，并编码 SUP、PES + MUI；也可把已有 SUP 转为 PES。',
         ).pack(fill='x', pady=(0, 12))
 
         file_outer, file_body = create_card(self, '字幕与输出')
@@ -565,6 +589,7 @@ class BdnSupPanel(ttk.Frame):
         self.lang_var = tk.StringVar(value='chi')
         self.make_sup_var = tk.BooleanVar(value=True)
         self.make_pes_var = tk.BooleanVar(value=False)
+        self.cleanup_bdn_var = tk.BooleanVar(value=False)
 
         def option_label(text, row, column, padx=(0, 0)):
             tk.Label(
@@ -593,6 +618,10 @@ class BdnSupPanel(ttk.Frame):
 
         toggle_frame = tk.Frame(option_card, bg=UI_CARD)
         toggle_frame.grid(row=2, column=0, columnspan=3, sticky='w', pady=(8, 0))
+        tk.Label(
+            toggle_frame, text='渲染链：SUPer（BDN + SUP）', bg=UI_CARD, fg=UI_MUTED,
+            font=(UI_FONT, UI_BODY_SIZE),
+        ).pack(side='left', padx=(0, px(18)))
         self.make_sup_check = tk.Checkbutton(
             toggle_frame, text='同时生成 SUP', variable=self.make_sup_var,
             bg=UI_CARD, fg=UI_TEXT, activebackground=UI_CARD, activeforeground=UI_TEXT,
@@ -600,8 +629,9 @@ class BdnSupPanel(ttk.Frame):
             highlightthickness=0, bd=0, padx=0, cursor='hand2',
         )
         self.make_sup_check.pack(side='left')
-        ToolTip(self.make_sup_check, '勾选后用 SUPer 把 BDN 编码为 SUP（PGS），输出 <字幕名>.sup。\n'
-                                     '取消则只生成 bdn.xml 和 PNG。')
+        ToolTip(self.make_sup_check,
+                '勾选后用 SUPer 把 BDN 编码为 <字幕名>.sup。\n'
+                '取消则只生成 bdn.xml 和 PNG。')
         self.make_pes_check = tk.Checkbutton(
             toggle_frame, text='同时生成 PES', variable=self.make_pes_var,
             bg=UI_CARD, fg=UI_TEXT, activebackground=UI_CARD, activeforeground=UI_TEXT,
@@ -610,7 +640,17 @@ class BdnSupPanel(ttk.Frame):
         )
         self.make_pes_check.pack(side='left', padx=(18, 0))
         ToolTip(self.make_pes_check, '勾选后除 SUP 外同时生成 PES + MUI 文件。\n'
-                                     'PES+MUI 用于 Scenarist 等蓝光 Authoring 软件；普通播放只用 SUP 即可。')
+                                     'PES/MUI 由 SUPer 链生成。')
+        self.cleanup_bdn_check = tk.Checkbutton(
+            toggle_frame, text='仅保留 SUP / PES', variable=self.cleanup_bdn_var,
+            bg=UI_CARD, fg=UI_TEXT, activebackground=UI_CARD, activeforeground=UI_TEXT,
+            selectcolor=UI_CARD, font=(UI_FONT, UI_BODY_SIZE),
+            highlightthickness=0, bd=0, padx=0, cursor='hand2',
+        )
+        self.cleanup_bdn_check.pack(side='left', padx=(18, 0))
+        ToolTip(self.cleanup_bdn_check,
+                '生成成功后删除中间的 bdn.xml 和 PNG，只保留 SUP / PES 文件。\n'
+                '需要保留画面帧用于检查时不要勾选。')
         ttk.Button(toggle_frame, text='高级参数', command=self.open_advanced, style='Secondary.TButton').pack(
             side='left', padx=(18, 0))
 
@@ -623,6 +663,13 @@ class BdnSupPanel(ttk.Frame):
         self.btn_cancel.pack(side='left', padx=(10, 0))
         self.btn_open = ttk.Button(action, text='打开输出文件夹', command=self.open_output, style='Secondary.TButton')
         self.btn_open.pack(side='left', padx=(10, 0))
+        self.btn_sup_to_pes = ttk.Button(
+            action, text='SUP 转 PES', command=self.convert_sup_to_pes,
+            style='Secondary.TButton')
+        self.btn_sup_to_pes.pack(side='left', padx=(10, 0))
+        ToolTip(self.btn_sup_to_pes,
+                '把已有 SUP 直接封装为 PES + MUI，不重新渲染、不重新编码。\n'
+                '输出到每个 SUP 所在目录，文件名与 SUP 相同。')
         self.status_var = tk.StringVar(value='')
         tk.Label(
             action, textvariable=self.status_var, bg=UI_BG, fg=UI_MUTED, font=(UI_FONT, UI_SMALL_SIZE),
@@ -649,8 +696,11 @@ class BdnSupPanel(ttk.Frame):
     def choose_ass(self):
         paths = filedialog.askopenfilenames(
             title='选择 ASS 字幕（可多选）', parent=self.winfo_toplevel(),
+            initialdir=last_directory('ass_file', self.out_var.get()),
             filetypes=[('ASS 字幕', '*.ass'), ('所有文件', '*.*')],
         )
+        if paths:
+            remember_directory('ass_file', paths[0])
         if paths and not self.append_ass_queue(paths):
             self.status_var.set('选择的文件已经在队列里')
 
@@ -728,6 +778,7 @@ class BdnSupPanel(ttk.Frame):
             self.lang_var.set(language)
         self.make_sup_var.set(bool(config.get('sup_make_sup', True)))
         self.make_pes_var.set(bool(config.get('sup_make_pes', False)))
+        self.cleanup_bdn_var.set(bool(config.get('sup_cleanup_bdn', False)))
         out_dir = str(config.get('sup_out') or '').strip()
         if out_dir:
             if out_dir.lower().endswith('_bdn'):
@@ -744,6 +795,7 @@ class BdnSupPanel(ttk.Frame):
             'sup_lang': self.lang_var.get(),
             'sup_make_sup': bool(self.make_sup_var.get()),
             'sup_make_pes': bool(self.make_pes_var.get()),
+            'sup_cleanup_bdn': bool(self.cleanup_bdn_var.get()),
             'sup_out': self.out_var.get(),
             'sup_out_auto': bool(self.sup_out_auto),
             'sup_params': dict(self.params),
@@ -752,14 +804,18 @@ class BdnSupPanel(ttk.Frame):
     def _save_options(self):
         config = load_config()
         config.pop('sup_font_dir', None)
+        config.pop('sup_effect', None)
         config.update(self.config_values())
         save_config(config)
 
     def choose_out(self):
         if self.running:
             return
-        path = filedialog.askdirectory(title='选择输出文件夹', parent=self.winfo_toplevel())
+        path = filedialog.askdirectory(
+            title='选择输出文件夹', parent=self.winfo_toplevel(),
+            initialdir=last_directory('ass_output', self.out_var.get()))
         if path:
+            remember_directory('ass_output', path)
             self.out_var.set(normalize_display_path(path))
             self.sup_out_auto = False
 
@@ -770,12 +826,91 @@ class BdnSupPanel(ttk.Frame):
         else:
             messagebox.showinfo('提示', '输出文件夹还不存在', parent=self.winfo_toplevel())
 
+    def convert_sup_to_pes(self):
+        if self.running:
+            return
+        paths = filedialog.askopenfilenames(
+            title='选择要转换的 SUP（可多选）', parent=self.winfo_toplevel(),
+            initialdir=last_directory('sup_file', self.out_var.get()),
+            filetypes=[('PGS 字幕', '*.sup'), ('所有文件', '*.*')])
+        if not paths:
+            return
+        remember_directory('sup_file', paths[0])
+        targets = []
+        for path in paths:
+            stem = os.path.splitext(os.path.basename(path))[0]
+            folder = os.path.dirname(os.path.abspath(path))
+            for suffix in ('.pes', '.pes.mui'):
+                target = os.path.join(folder, stem + suffix)
+                if os.path.exists(target):
+                    targets.append(target)
+        if targets:
+            listing = '\n'.join('· ' + os.path.basename(item)
+                                for item in targets[:8])
+            if len(targets) > 8:
+                listing += f'\n· … 共 {len(targets)} 个'
+            if not messagebox.askyesno(
+                    '确认覆盖',
+                    '以下 PES/MUI 已存在：\n' + listing +
+                    '\n\n继续转换会覆盖这些文件，是否继续？',
+                    parent=self.winfo_toplevel()):
+                return
+
+        outputs = []
+        failures = []
+        total = len(paths)
+        for index, path in enumerate(paths, 1):
+            name = os.path.basename(path)
+            last = {'percent': -10}
+
+            def progress(value, name=name, index=index, last=last):
+                percent = int(value)
+                if percent >= 100 or percent >= last['percent'] + 10:
+                    last['percent'] = percent
+                    self.status_var.set(
+                        f'SUP 转 PES（{index}/{total}）：{name} {percent}%')
+                    self.update_idletasks()
+
+            progress(0)
+            try:
+                ok, message, files = sup_to_pes(path, progress=progress)
+            except Exception as exc:
+                ok, message, files = False, str(exc), []
+            if ok:
+                outputs.extend(files)
+            else:
+                failures.append((name, message))
+
+        if failures:
+            detail = '\n'.join(f'· {name}：{message}'
+                               for name, message in failures[:8])
+            if len(failures) > 8:
+                detail += f'\n· … 共 {len(failures)} 个失败'
+            messagebox.showwarning(
+                'SUP 转 PES',
+                f'成功 {total - len(failures)}/{total}，失败 {len(failures)}。\n\n'
+                + detail,
+                parent=self.winfo_toplevel())
+        else:
+            listing = '\n'.join('· ' + os.path.basename(item)
+                                for item in outputs[:12])
+            if len(outputs) > 12:
+                listing += f'\n· … 共 {len(outputs)} 个文件'
+            messagebox.showinfo(
+                'SUP 转 PES',
+                f'已转换 {total} 个 SUP：\n\n' + listing,
+                parent=self.winfo_toplevel())
+        self.status_var.set(
+            f'SUP 转 PES 完成：成功 {total - len(failures)}/{total}')
+
     def _set_running(self, running: bool):
         self.running = running
         state = 'disabled' if running else 'normal'
         self.btn_start.config(state=state, text='生成中…' if running else '开始生成')
         self.btn_cancel.config(state='normal' if running else 'disabled')
-        for name in ('btn_choose_ass', 'btn_ass_queue_remove', 'btn_ass_queue_clear'):
+        for name in ('btn_choose_ass', 'btn_ass_queue_remove', 'btn_ass_queue_clear',
+                     'make_sup_check', 'make_pes_check', 'btn_sup_to_pes',
+                     'cleanup_bdn_check'):
             widget = getattr(self, name, None)
             if widget is not None:
                 widget.config(state=state)
@@ -815,7 +950,9 @@ class BdnSupPanel(ttk.Frame):
 
     def _expected_output_names(self, ass_path: str) -> list:
         stem = os.path.splitext(os.path.basename(ass_path))[0]
-        names = ['bdn.xml', stem + '.sup']
+        names = ['bdn.xml']
+        if self.make_sup_var.get() or self.make_pes_var.get():
+            names.append(stem + '.sup')
         if self.make_pes_var.get():
             names += [stem + '.pes', stem + '.pes.mui', stem + '.mui']
         return names
@@ -842,22 +979,21 @@ class BdnSupPanel(ttk.Frame):
         if not vsfilter_available():
             messagebox.showerror(
                 '缺少渲染组件',
-                '未找到 VSFilterMod 渲染组件（avs2bdnxml / VSFilterMod.dll）。\n'
-                '本软件只支持 VSFilterMod 渲染，请先重新安装工具。',
+                '未找到 VSFilterMod 渲染组件。\n'
+                '请确认 bin64\\avs2bdnxml.exe、AviSynth.dll、VSFilterMod.dll '
+                '存在，或保留 bin 作为 32 位回退。',
                 parent=self.winfo_toplevel())
             return
 
-        jobs = []
-        for path in paths:
-            base = out_root or os.path.dirname(os.path.abspath(path))
-            out_dir = os.path.join(
-                base, os.path.splitext(os.path.basename(path))[0] + '_BDN')
-            jobs.append({
+        jobs = [
+            {
                 'path': path,
                 'out_dir': out_dir,
                 'make_sup': bool(self.make_sup_var.get()),
                 'make_pes': bool(self.make_pes_var.get()),
-            })
+            }
+            for path, out_dir in build_output_dirs(paths, out_root)
+        ]
 
         missing = []
         for job in jobs:
@@ -877,6 +1013,14 @@ class BdnSupPanel(ttk.Frame):
                     '导致宽度、位置与预期不一致。\n\n建议先安装字体。仍要继续吗？',
                     parent=self.winfo_toplevel()):
                 return
+
+        # 图形字幕只保留 SUPer 链。
+        vertical_by_path = {
+            job['path']: ass_vertical_font_names(job['path'])
+            for job in jobs
+        }
+        for job in jobs:
+            job['vertical_fonts'] = vertical_by_path.get(job['path'], [])
 
         conflicts = []
         for job in jobs:
@@ -946,9 +1090,18 @@ class BdnSupPanel(ttk.Frame):
         make_pes = bool(self.make_pes_var.get())
         job_path = job['path']
         job_out = job['out_dir']
+        vertical_fonts = job.get('vertical_fonts') or []
+        cleanup_after = (
+            bool(self.cleanup_bdn_var.get())
+            and (make_sup or make_pes))
 
         def worker():
             try:
+                if vertical_fonts:
+                    self.ingest_log(
+                        f'检测到 @ 竖排字体（{" / ".join(vertical_fonts)}），'
+                        '使用 x64 GDI 渲染器')
+                self.ingest_log('SUPer 链：x64 渲染 BDN，再交给 SUPer')
                 ok, message, _outputs = generate_bdn_sup(
                     job_path, job_out,
                     fmt=fmt,
@@ -972,6 +1125,8 @@ class BdnSupPanel(ttk.Frame):
                                 + '；'.join(issues))
                     except Exception as exc:
                         log_exception('校验 BDN/SUP', exc)
+                if cleanup_after:
+                    cleanup_bdn_outputs(job_out)
             except RenderCancelled:
                 self._cleanup_cancelled(job_out, job_path)
                 self.queue.put(('cancelled',))

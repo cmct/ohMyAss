@@ -17,7 +17,7 @@ from theme_ui import (
     ToolTip, UI_ACCENT, UI_BG, UI_BODY_SIZE,
     UI_FONT, UI_MUTED, UI_PREVIEW_BG, UI_SMALL_SIZE,
     UI_TEXT, UI_TROUGH, add_combo_arrow, center_window,
-    prepare_combobox,
+    prepare_combobox, px,
 )
 from fonts import preview_font_path
 from subtitle_core import (
@@ -402,7 +402,7 @@ class StylePreviewWindow:
         self.canvas = tk.Canvas(
             body, width=self._canvas_width, height=self._canvas_height,
             bg=UI_PREVIEW_BG,
-            highlightthickness=1, highlightbackground='#313848', bd=0)
+            highlightthickness=px(1), highlightbackground='#313848', bd=0)
         self.canvas.pack()
 
         controls = tk.Frame(body, bg=UI_BG)
@@ -603,30 +603,8 @@ class StylePreviewWindow:
             draw.line([(x, y), (min(x + dash, end), y)], fill=colour, width=width)
             x += dash + gap
 
-    def redraw(self):
-        if Image is None or ImageDraw is None or ImageFont is None:
-            return
-        try:
-            bar = max(0.0, min(200.0, float(self.bar_var.get())))
-        except (TypeError, ValueError):
-            bar = 0.0
-
-        ss = 2
-        width, height = self._canvas_width, self._canvas_height
-        self._W, self._H = width * ss, height * ss
-        self._ss = ss
-        self._s = self._W / 1920.0
-
-        image = Image.new('RGB', (self._W, self._H), UI_PREVIEW_BG)
-        draw = ImageDraw.Draw(image)
-        bar_px = bar * self._s
-        if bar_px > 0:
-            draw.rectangle([0, 0, self._W, bar_px], fill='#000000')
-            draw.rectangle([0, self._H - bar_px, self._W, self._H], fill='#000000')
-
-        styles = self._style_map()
-        selected = STYLE_LABEL_TO_KIND.get(
-            self.style_var.get(), 'zh_dialogue_bilingual')
+    def _draw_sample(self, draw, styles, selected):
+        """绘制当前选中样式的示例字幕，返回 (顶边, 底边, 方向)。"""
         top_edge = None
         bottom_edge = None
         side = 'bottom'
@@ -649,7 +627,6 @@ class StylePreviewWindow:
                     center=self._W / 2, bottom=zh_bottom)
                 top_edge = zh_info['top']
                 bottom_edge = en_info['bottom']
-                side = 'bottom'
         elif selected in ('zh_lyrics_bilingual', 'en_lyrics_bilingual'):
             zh_style = styles.get('zh_lyrics_bilingual')
             en_style = styles.get('en_lyrics_bilingual')
@@ -701,7 +678,6 @@ class StylePreviewWindow:
                         bottom=second['top'] - gap)
                     top_edge = first['top']
                     bottom_edge = second['bottom']
-                    side = 'bottom'
         else:
             style = styles.get(selected)
             if style:
@@ -712,7 +688,6 @@ class StylePreviewWindow:
                         draw, sample, style,
                         self._H - style['mv'] * self._s - descent,
                         center=self._W / 2)
-                    side = 'bottom'
                 elif style['align'] == 8:
                     info = self._draw_baseline(
                         draw, sample, style,
@@ -728,6 +703,35 @@ class StylePreviewWindow:
                 top_edge = info['top']
                 bottom_edge = info['bottom']
 
+        return top_edge, bottom_edge, side
+
+
+    def redraw(self):
+        if Image is None or ImageDraw is None or ImageFont is None:
+            return
+        try:
+            bar = max(0.0, min(200.0, float(self.bar_var.get())))
+        except (TypeError, ValueError):
+            bar = 0.0
+
+        ss = 2
+        width, height = self._canvas_width, self._canvas_height
+        self._W, self._H = width * ss, height * ss
+        self._ss = ss
+        self._s = self._W / 1920.0
+
+        image = Image.new('RGB', (self._W, self._H), UI_PREVIEW_BG)
+        draw = ImageDraw.Draw(image)
+        bar_px = bar * self._s
+        if bar_px > 0:
+            draw.rectangle([0, 0, self._W, bar_px], fill='#000000')
+            draw.rectangle([0, self._H - bar_px, self._W, self._H], fill='#000000')
+
+        styles = self._style_map()
+        selected = STYLE_LABEL_TO_KIND.get(
+            self.style_var.get(), 'zh_dialogue_bilingual')
+        top_edge, bottom_edge, side = self._draw_sample(
+            draw, styles, selected)
         label_font = self._font(UI_FONT, int(11 * ss))
         if bar_px > 0:
             self._dashed(draw, bar_px, '#f59e0b')

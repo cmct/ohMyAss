@@ -3,33 +3,36 @@
 
 import os
 import io
-import re
 import json
 import csv
-import queue
 import shutil
-import threading
 import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from config_store import load_config, log_exception, save_config
+from config_store import (
+    last_directory, load_config, log_exception, remember_directory, save_config,
+)
 
 import theme_ui
 from theme_ui import (
-    ToolTip, UI_BG, UI_BODY_SIZE,
+    ToolTip, UI_ACCENT, UI_BG, UI_BODY_SIZE,
     UI_CARD, UI_CONFIRM, UI_DANGER, UI_FIELD, UI_FIELD_BORDER,
     UI_FONT, UI_MUTED, UI_SELECT, UI_SMALL_SIZE,
     UI_TEXT, add_combo_arrow, create_card,
     create_hero, prepare_combobox, px,
 )
 from reports import NOTICES_DATA_NAME, parse_issue_entries
+from task_runner import TaskRunner
 from subtitle_core import (
-    EDIT_SOURCE_PREFIX, convert_cht_contents,
-    format_ass_time, has_special_effect, match_cjk, normalize_glossary,
+    EDIT_SOURCE_PREFIX, format_ass_time, normalize_glossary,
     parse_ass_time, process_file, srt_to_ass,
 )
-from bdn_sup import read_ass_text
+from subtitle_outputs import (
+    delete_dialogue, layout_for_primary, leading_tags, measure_text,
+    primary_output_path, read_ass_text, strip_leading_tags, sync_outputs,
+    write_ass_lines,
+)
 
 BACKUP_ROOT = os.path.join(
     os.environ.get('LOCALAPPDATA') or os.path.expanduser('~'),
@@ -93,7 +96,7 @@ class GlossaryPanel(ttk.Frame):
         tree_border = tk.Frame(card, bg=UI_FIELD_BORDER)
         tree_border.grid(row=0, column=0, sticky='nsew')
         tree_frame = tk.Frame(tree_border, bg=UI_FIELD)
-        tree_frame.pack(fill='both', expand=True, padx=1, pady=1)
+        tree_frame.pack(fill='both', expand=True, padx=px(1), pady=px(1))
         tree_frame.rowconfigure(0, weight=1)
         tree_frame.columnconfigure(0, weight=1)
         self.tree = ttk.Treeview(
@@ -114,6 +117,10 @@ class GlossaryPanel(ttk.Frame):
         tree_scroll.grid(row=0, column=1, sticky='ns')
         self.tree.configure(yscrollcommand=tree_scroll.set)
         self.tree.bind('<<TreeviewSelect>>', self.on_select)
+        self.tree.bind(
+            '<FocusIn>', lambda event: tree_border.configure(bg=UI_ACCENT))
+        self.tree.bind(
+            '<FocusOut>', lambda event: tree_border.configure(bg=UI_FIELD_BORDER))
 
         form = tk.Frame(card, bg=UI_CARD)
         form.grid(row=1, column=0, sticky='ew', pady=(10, 0))
@@ -257,10 +264,12 @@ class GlossaryPanel(ttk.Frame):
         path = filedialog.askopenfilename(
             parent=self.winfo_toplevel(),
             title='导入术语表',
+            initialdir=last_directory('fixer_import'),
             filetypes=[('CSV / TSV', '*.csv *.tsv *.txt'),
                        ('所有文件', '*.*')])
         if not path:
             return
+        remember_directory('fixer_import', path)
         try:
             with open(path, 'rb') as handle:
                 raw = handle.read()
@@ -328,11 +337,13 @@ class GlossaryPanel(ttk.Frame):
         path = filedialog.asksaveasfilename(
             parent=self.winfo_toplevel(),
             title='导出术语表',
+            initialdir=last_directory('fixer_export'),
             defaultextension='.csv',
             initialfile='术语表.csv',
             filetypes=[('CSV', '*.csv'), ('所有文件', '*.*')])
         if not path:
             return
+        remember_directory('fixer_export', path)
         try:
             with open(path, 'w', encoding='utf-8-sig', newline='') as handle:
                 writer = csv.writer(handle)
@@ -371,7 +382,11 @@ class IssueFixerPanel(ttk.Frame):
         self.undo_stack = []
         self.dirty = False
         self.running = False
-        self.save_queue = queue.Queue()
+        self.task_runner = TaskRunner(self, 150)
+        self._cht_cache = {}
+        self.filter_text = ''
+        self.filter_need = ''
+        self._filter_job = None
         self.build_ui()
 
     def build_ui(self):
@@ -410,6 +425,7 @@ class IssueFixerPanel(ttk.Frame):
         choose_button = ttk.Button(
             file_body, text='选择', command=self.choose_file, style='Secondary.TButton',
         )
+        self.btn_choose_file = choose_button
         choose_button.grid(row=0, column=2, padx=(10, 0), pady=4)
         ToolTip(
             choose_button,
@@ -418,12 +434,38 @@ class IssueFixerPanel(ttk.Frame):
         list_outer, list_body = create_card(self, '待处理字幕')
         list_outer.pack(fill='both', expand=True)
         list_body.columnconfigure(0, weight=1)
-        list_body.rowconfigure(0, weight=1)
+        list_body.rowconfigure(1, weight=1)
+
+        filter_row = tk.Frame(list_body, bg=UI_CARD)
+        filter_row.grid(row=0, column=0, sticky='ew', pady=(0, 6))
+        filter_row.columnconfigure(1, weight=1)
+        tk.Label(
+            filter_row, text='搜索', bg=UI_CARD, fg=UI_TEXT,
+            font=(UI_FONT, UI_BODY_SIZE),
+        ).grid(row=0, column=0, sticky='w', padx=(0, 8))
+        self.filter_var = tk.StringVar(value='')
+        self.filter_entry = ttk.Entry(filter_row, textvariable=self.filter_var)
+        self.filter_entry.grid(row=0, column=1, sticky='ew')
+        self.filter_need_var = tk.StringVar(value='全部')
+        self.filter_need_combo = add_combo_arrow(prepare_combobox(ttk.Combobox(
+            filter_row, textvariable=self.filter_need_var, state='readonly',
+            values=('全部', '请处理', '请确认'), width=9)))
+        self.filter_need_combo.grid(row=0, column=2, sticky='e', padx=(8, 0))
+        self.filter_count = tk.Label(
+            filter_row, text='', bg=UI_CARD, fg=UI_MUTED,
+            font=(UI_FONT, UI_SMALL_SIZE), width=14, anchor='e',
+        )
+        self.filter_count.grid(row=0, column=3, sticky='e', padx=(10, 0))
+        self.filter_var.trace_add('write', lambda *args: self._on_filter_change())
+        self.filter_need_combo.bind(
+            '<<ComboboxSelected>>', lambda event: self._on_filter_change())
 
         tree_border = tk.Frame(list_body, bg=UI_FIELD_BORDER)
-        tree_border.grid(row=0, column=0, sticky='nsew')
+        tree_border.grid(row=1, column=0, sticky='nsew')
+        self.tree_border = tree_border
+        border_px = px(1)
         tree_frame = tk.Frame(tree_border, bg=UI_FIELD)
-        tree_frame.pack(fill='both', expand=True, padx=1, pady=1)
+        tree_frame.pack(fill='both', expand=True, padx=border_px, pady=border_px)
         tree_frame.rowconfigure(0, weight=1)
         tree_frame.columnconfigure(0, weight=1)
         self.tree = ttk.Treeview(
@@ -445,41 +487,50 @@ class IssueFixerPanel(ttk.Frame):
         self.tree.tag_configure('process', foreground=UI_DANGER)
         self.tree.tag_configure('verify', foreground=UI_CONFIRM)
         self.tree.bind('<<TreeviewSelect>>', self.on_select)
+        self.tree.bind(
+            '<FocusIn>',
+            lambda event: self.tree_border.configure(bg=UI_ACCENT))
+        self.tree.bind(
+            '<FocusOut>',
+            lambda event: self.tree_border.configure(bg=UI_FIELD_BORDER))
         self.row_menu = tk.Menu(self.tree, tearoff=0)
         self.row_menu.add_command(
             label='删除字幕条', command=self.delete_selected_row)
         self.tree.bind('<Button-3>', self._show_row_menu)
 
         bottom = tk.Frame(list_body, bg=UI_CARD)
-        bottom.grid(row=1, column=0, sticky='ew', pady=(8, 0))
+        bottom.grid(row=2, column=0, sticky='ew', pady=(8, 0))
         bottom.columnconfigure(1, weight=1)
 
         form = tk.Frame(bottom, bg=UI_CARD)
         form.grid(row=0, column=0, sticky='nw')
-        form.columnconfigure(1, weight=1)
 
         self.start_var = tk.StringVar(value='')
         self.end_var = tk.StringVar(value='')
         self.style_var = tk.StringVar(value='')
 
-        tk.Label(
-            form, text='样式', bg=UI_CARD, fg=UI_TEXT, font=(UI_FONT, UI_BODY_SIZE),
-        ).grid(row=0, column=0, sticky='w', padx=(0, 10), pady=(0, 4))
+        def form_label(parent, text):
+            label = tk.Label(
+                parent, text=text, bg=UI_CARD, fg=UI_TEXT,
+                font=(UI_FONT, UI_BODY_SIZE), width=4, anchor='w')
+            label.pack(side='left', padx=(0, 6))
+            return label
+
+        style_row = tk.Frame(form, bg=UI_CARD)
+        style_row.pack(anchor='w', pady=(0, 4))
+        form_label(style_row, '样式')
         self.style_combo = add_combo_arrow(prepare_combobox(ttk.Combobox(
-            form, textvariable=self.style_var, state='readonly', width=24)))
-        self.style_combo.grid(row=0, column=1, sticky='ew', pady=(0, 4))
+            style_row, textvariable=self.style_var, state='readonly', width=24)))
+        self.style_combo.pack(side='left')
 
-        tk.Label(
-            form, text='开始', bg=UI_CARD, fg=UI_TEXT, font=(UI_FONT, UI_BODY_SIZE),
-        ).grid(row=1, column=0, sticky='w', padx=(0, 10), pady=(0, 4))
-        ttk.Entry(form, textvariable=self.start_var, width=24).grid(
-            row=1, column=1, sticky='ew', pady=(0, 4))
-        tk.Label(
-            form, text='结束', bg=UI_CARD, fg=UI_TEXT, font=(UI_FONT, UI_BODY_SIZE),
-        ).grid(row=2, column=0, sticky='w', padx=(0, 10), pady=(0, 4))
-        ttk.Entry(form, textvariable=self.end_var, width=24).grid(
-            row=2, column=1, sticky='ew', pady=(0, 4))
-
+        start_row = tk.Frame(form, bg=UI_CARD)
+        start_row.pack(anchor='w', pady=(0, 4))
+        form_label(start_row, '开始')
+        ttk.Entry(start_row, textvariable=self.start_var, width=12).pack(side='left')
+        end_row = tk.Frame(form, bg=UI_CARD)
+        end_row.pack(anchor='w')
+        form_label(end_row, '结束')
+        ttk.Entry(end_row, textvariable=self.end_var, width=12).pack(side='left')
         text_frame = tk.Frame(bottom, bg=UI_CARD)
         text_frame.grid(row=0, column=1, sticky='nsew', padx=(16, 0))
         text_frame.columnconfigure(0, weight=1)
@@ -504,6 +555,12 @@ class IssueFixerPanel(ttk.Frame):
         self.text_edit.bind(
             '<FocusOut>',
             lambda event: text_border.configure(style='Field.TFrame'))
+        self.text_count = tk.Label(
+            text_frame, text='', bg=UI_CARD, fg=UI_MUTED,
+            font=(UI_FONT, UI_SMALL_SIZE), anchor='w',
+        )
+        self.text_count.grid(row=1, column=0, sticky='ew', pady=(4, 0))
+        self.text_edit.bind('<<Modified>>', self._on_text_modified)
         self.save_hint = tk.Label(
             bottom,
             text='载入问题数据后可保存修改；双语片源以简英双语为基础，单语片源以简体中文为基础。',
@@ -532,13 +589,18 @@ class IssueFixerPanel(ttk.Frame):
         self.btn_reload.pack(side='left', padx=(10, 0))
 
         self.status_var = tk.StringVar(value='请选择问题数据文件')
-        ttk.Label(action, textvariable=self.status_var, style='Status.TLabel').pack(
-            side='left', padx=(16, 0))
+        self.status_label = ttk.Label(
+            action, textvariable=self.status_var, style='Status.TLabel',
+            anchor='w')
+        self.status_label.pack(
+            side='left', fill='x', expand=True, padx=(16, 8))
 
     def _buttons(self, enabled: bool):
         state = 'normal' if enabled else 'disabled'
-        for button in (self.btn_apply, self.btn_save, self.btn_reload):
-            button.config(state=state)
+        for button in (self.btn_apply, self.btn_save, self.btn_reload,
+                       getattr(self, 'btn_choose_file', None)):
+            if button is not None:
+                button.config(state=state)
         self.btn_undo.config(
             state='normal' if enabled and self.undo_stack else 'disabled')
 
@@ -553,6 +615,7 @@ class IssueFixerPanel(ttk.Frame):
             return
         path = filedialog.askopenfilename(
             title='选择问题数据',
+            initialdir=last_directory('fixer_file'),
             filetypes=[
                 ('问题数据 / 报告', '*.json *.html'),
                 ('问题数据', '*.json'),
@@ -562,10 +625,11 @@ class IssueFixerPanel(ttk.Frame):
             parent=self.winfo_toplevel(),
         )
         if path:
+            remember_directory('fixer_file', path)
             self.load(path)
 
     def reload(self):
-        if not self.data:
+        if self.running or not self.data:
             return
         self.load(os.path.join(self.output_dir, NOTICES_DATA_NAME))
 
@@ -581,55 +645,15 @@ class IssueFixerPanel(ttk.Frame):
 
     def _primary_output_path(self, data):
         """生成后的主字幕：简英双语；单语片源用简体中文。"""
-        output_dir = str(data.get('output_dir') or '')
-        if not output_dir:
-            return ''
-        names = []
-        if data.get('is_hdr'):
-            names += ['1-简英双语-HDR-zh.ass', '1-简体中文-HDR-zh.ass']
-        names += ['1-简英双语-zh.ass', '1-简体中文-zh.ass']
-        for name in names:
-            path = os.path.join(output_dir, name)
-            if os.path.isfile(path):
-                return path
-        return ''
+        return primary_output_path(data)
 
     @staticmethod
     def _leading_tags(text):
-        match = re.match(r'^((?:\{[^}]*\})+)?', text)
-        return match.group(1) if match and match.group(1) else ''
+        return leading_tags(text)
 
     @staticmethod
     def _strip_leading_tags(text):
-        return re.sub(r'^(?:\{[^}]*\})+', '', text)
-
-    @staticmethod
-    def _visible_text(text):
-        return re.sub(r'\{[^}]*\}', '', text)
-
-    def _split_languages(self, text):
-        """把双语文本按可见文字拆成 (中文部分, 英文部分)。"""
-        chinese = []
-        english = []
-        for part in text.split('\\N'):
-            visible = self._visible_text(part)
-            if match_cjk.search(visible) or not re.search(r'[A-Za-z]', visible):
-                chinese.append(part)
-            else:
-                english.append(part)
-        return '\\N'.join(chinese), '\\N'.join(english)
-
-    @staticmethod
-    def _dialogue_records(lines):
-        records = []
-        for index, line in enumerate(lines):
-            if not line.lstrip().lower().startswith('dialogue:'):
-                continue
-            fields = line.split(',', 9)
-            if len(fields) < 10:
-                continue
-            records.append((index, fields, has_special_effect(fields[9])))
-        return records
+        return strip_leading_tags(text)
 
     def _start_backup_batch(self):
         stamp = time.strftime('%Y%m%d_%H%M%S')
@@ -659,150 +683,22 @@ class IssueFixerPanel(ttk.Frame):
                 log_exception('备份字幕文件', exc)
         else:
             shutil.copy2(path, path + '.bak')
-        with open(path, 'w', encoding='utf-8-sig', newline='') as handle:
-            handle.write('\n'.join(lines))
-
-    @staticmethod
-    def _target_specs(is_bilingual):
-        if is_bilingual:
-            return [
-                ('2-简体中文-zh.ass', 'chs'),
-                ('3-繁体中文-zh.ass', 'cht'),
-                ('4-英文-en.ass', 'eng'),
-                ('2-简英双语-SDR-zh.ass', 'sdr'),
-                ('3-简体中文-HDR-zh.ass', 'chs'),
-                ('4-繁体中文-HDR-zh.ass', 'cht'),
-                ('5-英文-HDR-en.ass', 'eng'),
-            ]
-        return [
-            ('2-简体中文-zh.ass', 'chs'),
-            ('2-繁体中文-zh.ass', 'cht'),
-            ('2-简体中文-SDR-zh.ass', 'sdr'),
-            ('3-繁体中文-HDR-zh.ass', 'cht'),
-        ]
+        write_ass_lines(path, lines)
 
     def _sync_outputs(self, lines):
-        """把主字幕的文本同步到其他语言文件，返回已同步文件名。"""
-        primary = self.primary_output
-        out_dir = os.path.dirname(primary)
-        is_bilingual = os.path.basename(primary).startswith('1-简英双语')
-        primary_records = self._dialogue_records(lines)
-        targets = self._target_specs(is_bilingual)
+        """把主字幕的文本同步到其他语言文件。"""
+        layout = layout_for_primary(self.primary_output)
         meta = dict(self.data.get('meta') or {})
-        chinese_entries = []
-        english_entries = []
-        full_entries = []
-        for _index, fields, special in primary_records:
-            entry = (fields[1], fields[2], fields[9])
-            full_entries.append(entry)
-            if special:
-                chinese_entries.append(entry)
-                continue
-            if is_bilingual:
-                chinese, english = self._split_languages(fields[9])
-                if chinese:
-                    chinese_entries.append((fields[1], fields[2], chinese))
-                if english:
-                    english_entries.append((fields[1], fields[2], english))
-            else:
-                chinese_entries.append(entry)
-        synced = []
-        for name, role in targets:
-            path = os.path.join(out_dir, name)
-            if not os.path.isfile(path):
-                continue
-            text = read_ass_text(path)
-            if not text:
-                continue
-            target_lines = text.replace('\r\n', '\n').replace('\r', '\n').split('\n')
-            target_records = self._dialogue_records(target_lines)
-            if role in ('chs', 'cht'):
-                entries = chinese_entries
-            elif role == 'eng':
-                entries = english_entries
-            else:
-                entries = full_entries
-            if len(entries) != len(target_records):
-                log_exception(
-                    f'同步跳过：{name}（主字幕 {len(entries)} 行，目标 {len(target_records)} 行）')
-                continue
-            for (target_index, target_fields, _special), (start, end, new_text) in zip(
-                    target_records, entries):
-                if role == 'eng':
-                    prefix = self._leading_tags(target_fields[9]) or '{\\blur2}'
-                    new_text = prefix + self._strip_leading_tags(new_text)
-                target_fields[1] = start
-                target_fields[2] = end
-                target_fields[9] = new_text
-                target_lines[target_index] = ','.join(target_fields)
-            if role == 'cht':
-                try:
-                    target_lines, _changes, _error, _overlong = convert_cht_contents(
-                        target_lines, use_api=bool(meta.get('taiwan', True)))
-                except Exception as exc:
-                    log_exception('同步繁体字幕', exc)
-            self._write_ass_lines(path, target_lines)
-            synced.append(name)
-        return synced
+        result = sync_outputs(
+            layout, self.primary_output, lines, meta, self._cht_cache)
+        self._cht_cache = result.cht_cache
+        return result
 
     def _delete_from_outputs(self, lines, position):
         """从其他语言文件中删除与主字幕第 position 条对应的行。"""
-        primary = self.primary_output
-        out_dir = os.path.dirname(primary)
-        is_bilingual = os.path.basename(primary).startswith('1-简英双语')
-        records = self._dialogue_records(lines)
-        if not (0 <= position < len(records)):
-            return [], []
-        chinese_positions = []
-        english_positions = []
-        for pos, (_index, fields, is_special) in enumerate(records):
-            if is_special:
-                chinese_positions.append(pos)
-                continue
-            if is_bilingual:
-                chinese, english = self._split_languages(fields[9])
-                if chinese:
-                    chinese_positions.append(pos)
-                if english:
-                    english_positions.append(pos)
-            else:
-                chinese_positions.append(pos)
-        deleted = []
-        skipped = []
-        for name, role in self._target_specs(is_bilingual):
-            path = os.path.join(out_dir, name)
-            if not os.path.isfile(path):
-                continue
-            if role in ('chs', 'cht'):
-                sequence = chinese_positions
-            elif role == 'eng':
-                sequence = english_positions
-            else:
-                sequence = list(range(len(records)))
-            if position not in sequence:
-                continue
-            text = read_ass_text(path)
-            if not text:
-                continue
-            target_lines = text.replace('\r\n', '\n').replace('\r', '\n').split('\n')
-            target_records = self._dialogue_records(target_lines)
-            if len(target_records) != len(sequence):
-                skipped.append(name)
-                log_exception(
-                    f'删除同步跳过：{name}（主字幕 {len(sequence)} 行，目标 {len(target_records)} 行）')
-                continue
-            ordinal = sequence.index(position)
-            line_index = target_records[ordinal][0]
-            del target_lines[line_index]
-            try:
-                self._write_ass_lines(path, target_lines)
-            except OSError as exc:
-                skipped.append(name)
-                log_exception(f'删除同步失败：{name}', exc)
-                continue
-            deleted.append(name)
-        return deleted, skipped
-
+        layout = layout_for_primary(self.primary_output)
+        result = delete_dialogue(layout, self.primary_output, lines, position)
+        return result.deleted, result.skipped
     def _show_row_menu(self, event):
         row = self.tree.identify_row(event.y)
         if not row:
@@ -858,9 +754,7 @@ class IssueFixerPanel(ttk.Frame):
         self.running = True
         self._buttons(False)
         self._status('正在同步删除并重新分析…')
-        self.save_queue = queue.Queue()
-
-        def worker():
+        def worker(emit):
             deleted = []
             skipped = []
             sync_error = ''
@@ -876,20 +770,17 @@ class IssueFixerPanel(ttk.Frame):
             except Exception as exc:
                 analysed = False
                 log_exception('删除后重新分析', exc)
-            self.save_queue.put((
-                'delete_done', index, line_index, deleted, skipped,
-                sync_error, analysed))
+            emit('delete_done', index, line_index, deleted, skipped,
+                 sync_error, analysed)
 
-        threading.Thread(target=worker, daemon=True).start()
-        self.after(150, self._poll_save)
+        self.task_runner.start(worker, self._task_event)
 
     def _cleanup_legacy_baks(self):
         """清理旧版本在输出目录留下的同名 .bak 文件。"""
         if not self.output_dir or not self.primary_output or not self.backup_dir:
             return
-        is_bilingual = os.path.basename(self.primary_output).startswith('1-简英双语')
-        names = {os.path.basename(self.primary_output)}
-        names.update(name for name, _role in self._target_specs(is_bilingual))
+        names = set(layout_for_primary(self.primary_output).outputs)
+        names.add(os.path.basename(self.primary_output))
         for name in names:
             path = os.path.join(self.output_dir, name + '.bak')
             if os.path.isfile(path):
@@ -905,6 +796,8 @@ class IssueFixerPanel(ttk.Frame):
         meta['source_label'] = (
             self.data.get('source_label')
             or os.path.basename(self.primary_output))
+        if self._cht_cache:
+            meta['cht_cache'] = self._cht_cache
         process_file(
             self.primary_output,
             bool(self.data.get('is_hdr')),
@@ -914,6 +807,8 @@ class IssueFixerPanel(ttk.Frame):
         )
 
     def load(self, path: str, silent: bool = False, reset_undo: bool = True):
+        if self.running:
+            return
         if path.lower().endswith('.html'):
             path = os.path.join(os.path.dirname(path), NOTICES_DATA_NAME)
         try:
@@ -1020,20 +915,94 @@ class IssueFixerPanel(ttk.Frame):
         preview = text.replace('\r', '').replace('\n', '\\N')
         return start, end, style, text, preview
 
-    def refresh_tree(self, select=None):
-        self.tree.delete(*self.tree.get_children())
+    def _visible_indexes(self):
+        text = (self.filter_text or '').casefold()
+        need = self.filter_need or ''
+        result = []
         for index in sorted(self.entries):
             item = self.entries[index]
-            _, _, _, _, preview = self._entry_values(index)
-            tag = 'process' if item['need'] == '请处理' else 'verify'
-            self.tree.insert('', 'end', iid=str(index), values=(
-                index, item['need'], '；'.join(item['problems']), preview), tags=(tag,))
+            if need and item['need'] != need:
+                continue
+            if text:
+                preview = self._entry_values(index)[4]
+                haystack = (
+                    f'{index} {item["need"]} '
+                    + ' '.join(item['problems']) + ' ' + preview).casefold()
+                if text not in haystack:
+                    continue
+            result.append(index)
+        return result
+
+    def _update_filter_count(self, visible=None):
+        total = len(self.entries)
+        if visible is None:
+            visible = self._visible_indexes()
+        if not total:
+            self.filter_count.config(text='')
+        elif len(visible) == total:
+            self.filter_count.config(text=f'共 {total} 条')
+        else:
+            self.filter_count.config(text=f'显示 {len(visible)} / {total} 条')
+
+    def _on_filter_change(self):
+        self.filter_text = self.filter_var.get().strip()
+        need = self.filter_need_var.get().strip()
+        self.filter_need = '' if need in ('', '全部') else need
+        if self._filter_job is not None:
+            try:
+                self.after_cancel(self._filter_job)
+            except tk.TclError:
+                pass
+        self._filter_job = self.after(120, self._apply_filter)
+
+    def _apply_filter(self):
+        self._filter_job = None
+        if self.entries:
+            self.refresh_tree()
+        else:
+            self._update_filter_count([])
+
+    def _row_values(self, index):
+        item = self.entries[index]
+        _, _, _, _, preview = self._entry_values(index)
+        tag = 'process' if item['need'] == '请处理' else 'verify'
+        return (
+            index, item['need'], '；'.join(item['problems']), preview), tag
+
+    def refresh_row(self, index):
+        """只刷新一行，避免每次应用修改都重建整张表。"""
+        iid = str(index)
+        if index not in self.entries or index not in self._visible_indexes():
+            if self.tree.exists(iid):
+                self.tree.delete(iid)
+            self._update_filter_count()
+            return
+        values, tag = self._row_values(index)
+        if self.tree.exists(iid):
+            self.tree.item(iid, values=values, tags=(tag,))
+        else:
+            self.tree.insert('', 'end', iid=iid, values=values, tags=(tag,))
+        self._update_filter_count()
+
+    def refresh_tree(self, select=None):
+        self.tree.delete(*self.tree.get_children())
+        visible = self._visible_indexes()
+        for index in visible:
+            values, tag = self._row_values(index)
+            self.tree.insert('', 'end', iid=str(index), values=values, tags=(tag,))
+        self._update_filter_count(visible)
         if select is not None and str(select) in self.tree.get_children():
             iid = str(select)
             self.tree.selection_set(iid)
             self.tree.focus(iid)
             self.tree.see(iid)
             self.on_select()
+
+    def _next_visible_index(self, index):
+        for candidate in self._visible_indexes():
+            if candidate > index:
+                return candidate
+        return None
 
     def on_select(self, event=None):
         selection = self.tree.selection()
@@ -1048,6 +1017,26 @@ class IssueFixerPanel(ttk.Frame):
         self.style_var.set(style)
         self.text_edit.delete('1.0', 'end')
         self.text_edit.insert('1.0', text)
+        self.update_text_count()
+
+    def _on_text_modified(self, event=None):
+        try:
+            if not self.text_edit.edit_modified():
+                return
+            self.text_edit.edit_modified(False)
+        except tk.TclError:
+            return
+        self.update_text_count()
+
+    def update_text_count(self):
+        stats = measure_text(self.text_edit.get('1.0', 'end-1c'))
+        self.text_count.config(
+            text=(
+                f'中文 {stats["zh"]}/{stats["zh_limit"]} 字 · '
+                f'英文 {stats["en"]}/{stats["en_limit"]} 字符'
+            ),
+            fg=UI_DANGER if stats['over'] else UI_MUTED,
+        )
 
     def _current_edit(self):
         selection = self.tree.selection()
@@ -1081,7 +1070,15 @@ class IssueFixerPanel(ttk.Frame):
         self.edits[index] = edit
         self.dirty = True
         self.btn_undo.config(state='normal')
-        self.refresh_tree(select=index)
+        self.refresh_row(index)
+        next_index = self._next_visible_index(index)
+        target = next_index if next_index is not None else index
+        iid = str(target)
+        if self.tree.exists(iid):
+            self.tree.selection_set(iid)
+            self.tree.focus(iid)
+            self.tree.see(iid)
+            self.on_select()
         self._status(
             f'已修改 {len(self.edits)} 条 · 点「{self.btn_save.cget("text")}」写入字幕')
 
@@ -1113,7 +1110,7 @@ class IssueFixerPanel(ttk.Frame):
             else:
                 self.edits[index] = previous
             self.dirty = bool(self.edits)
-            self.refresh_tree(select=index)
+            self.refresh_row(index)
             try:
                 self.tree.selection_set(str(index))
                 self.on_select()
@@ -1126,9 +1123,7 @@ class IssueFixerPanel(ttk.Frame):
         self.running = True
         self._buttons(False)
         self._status(f'正在撤回：{label}…')
-        self.save_queue = queue.Queue()
-
-        def worker():
+        def worker(emit):
             error = ''
             try:
                 self._restore_backup(backup_dir)
@@ -1136,10 +1131,9 @@ class IssueFixerPanel(ttk.Frame):
             except Exception as exc:
                 error = str(exc)
                 log_exception('撤回操作', exc)
-            self.save_queue.put(('undo_done', label, error))
+            emit('undo_done', label, error)
 
-        threading.Thread(target=worker, daemon=True).start()
-        self.after(150, self._poll_save)
+        self.task_runner.start(worker, self._task_event)
 
     def save_and_regenerate(self):
         if self.running or not self.data:
@@ -1200,8 +1194,7 @@ class IssueFixerPanel(ttk.Frame):
             working = self.source_path
         try:
             os.makedirs(output_dir, exist_ok=True)
-            with open(working, 'w', encoding='utf-8-sig', newline='') as handle:
-                handle.write('\n'.join(lines))
+            write_ass_lines(working, lines)
         except OSError as exc:
             messagebox.showerror('保存失败', str(exc), parent=self.winfo_toplevel())
             return
@@ -1214,20 +1207,18 @@ class IssueFixerPanel(ttk.Frame):
         self.running = True
         self._buttons(False)
         self._status('正在重新生成字幕…')
-        self.save_queue = queue.Queue()
         is_hdr = bool(self.data.get('is_hdr'))
         is_mid_black = bool(self.data.get('is_mid_black'))
 
-        def worker():
+        def worker(emit):
             try:
                 _, outdir, _ = process_file(working, is_hdr, is_mid_black, meta)
-                self.save_queue.put(('done', outdir))
+                emit('done', outdir)
             except Exception as exc:
                 log_exception('问题修复重新生成', exc)
-                self.save_queue.put(('error', str(exc)))
+                emit('error', str(exc))
 
-        threading.Thread(target=worker, daemon=True).start()
-        self.after(150, self._poll_save)
+        self.task_runner.start(worker, self._task_event)
 
     def _save_primary_lines(self, lines):
         target = self.primary_output
@@ -1247,13 +1238,11 @@ class IssueFixerPanel(ttk.Frame):
         self.running = True
         self._buttons(False)
         self._status('正在同步其他语言字幕…')
-        self.save_queue = queue.Queue()
-
-        def worker():
-            synced = []
+        def worker(emit):
+            sync = None
             sync_error = ''
             try:
-                synced = self._sync_outputs(lines)
+                sync = self._sync_outputs(lines)
             except Exception as exc:
                 sync_error = str(exc)
                 log_exception('同步其他语言字幕', exc)
@@ -1263,44 +1252,45 @@ class IssueFixerPanel(ttk.Frame):
             except Exception as exc:
                 analysed = False
                 log_exception('问题修复重新分析', exc)
-            self.save_queue.put(
-                ('primary_done', synced, sync_error, analysed, target))
+            emit('primary_done', sync, sync_error, analysed, target)
 
-        threading.Thread(target=worker, daemon=True).start()
-        self.after(150, self._poll_save)
+        self.task_runner.start(worker, self._task_event)
 
-    def _poll_save(self):
-        try:
-            item = self.save_queue.get_nowait()
-        except queue.Empty:
-            self.after(150, self._poll_save)
-            return
+    def _task_event(self, kind, *payload):
         self.running = False
         self._buttons(True)
-        if item[0] == 'primary_done':
-            _kind, synced, sync_error, analysed, target = item
+        if kind == 'primary_done':
+            sync, sync_error, analysed, target = payload
             self.dirty = False
+            self.edits = {}
             self.undo_stack.clear()
             if analysed:
                 json_path = os.path.join(self.output_dir, NOTICES_DATA_NAME)
                 if os.path.isfile(json_path):
                     self.load(json_path, silent=True, reset_undo=False)
             self._buttons(True)
+            synced = list(getattr(sync, 'synced', []) or [])
+            skipped = list(getattr(sync, 'skipped', []) or [])
+            conversion_error = str(getattr(sync, 'error', '') or '')
             summary = '、'.join(synced) if synced else '没有需要同步的其他语言文件'
             self._status(f'已保存并同步：{summary}')
             lines = [
                 f'已写回：\n{target}',
                 f'已同步：{summary}',
             ]
+            if skipped:
+                lines.append('未同步（行数不一致）：' + '、'.join(skipped))
             if sync_error:
                 lines.append(f'同步失败：{sync_error}')
+            if conversion_error:
+                lines.append(f'繁体转换提示：{conversion_error}')
             lines.append(
                 '问题报告已重新分析。' if analysed
                 else '问题报告未能重新分析，详见错误日志。')
             if self.backup_dir:
                 lines.append(f'备份：{self.backup_dir}')
             self._cleanup_legacy_baks()
-            if sync_error or not analysed:
+            if sync_error or skipped or conversion_error or not analysed:
                 messagebox.showwarning(
                     '保存完成（部分失败）', '\n\n'.join(lines),
                     parent=self.winfo_toplevel())
@@ -1308,10 +1298,10 @@ class IssueFixerPanel(ttk.Frame):
                 messagebox.showinfo(
                     '保存完成', '\n\n'.join(lines),
                     parent=self.winfo_toplevel())
-            return
-        if item[0] == 'delete_done':
-            (_kind, index, line_index, deleted, skipped,
-             sync_error, analysed) = item
+            return False
+        if kind == 'delete_done':
+            (index, line_index, deleted, skipped,
+             sync_error, analysed) = payload
             self.dirty = False
             if analysed:
                 json_path = os.path.join(self.output_dir, NOTICES_DATA_NAME)
@@ -1352,14 +1342,14 @@ class IssueFixerPanel(ttk.Frame):
                 messagebox.showinfo(
                     '删除完成', '\n\n'.join(lines),
                     parent=self.winfo_toplevel())
-            return
-        if item[0] == 'undo_done':
-            _kind, label, error = item
+            return False
+        if kind == 'undo_done':
+            label, error = payload
             if error:
                 self._status('撤回失败')
                 messagebox.showerror(
                     '撤回失败', error, parent=self.winfo_toplevel())
-                return
+                return False
             json_path = os.path.join(self.output_dir, NOTICES_DATA_NAME)
             if os.path.isfile(json_path):
                 self.load(json_path, silent=True, reset_undo=False)
@@ -1368,12 +1358,13 @@ class IssueFixerPanel(ttk.Frame):
                 '撤回完成',
                 f'已撤回：{label}\n字幕文件与问题报告已恢复。',
                 parent=self.winfo_toplevel())
-            return
-        if item[0] == 'error':
+            return False
+        if kind == 'error':
             self._status('重新生成失败')
-            messagebox.showerror('重新生成失败', item[1], parent=self.winfo_toplevel())
-            return
-        outdir = item[1]
+            messagebox.showerror(
+                '重新生成失败', payload[0], parent=self.winfo_toplevel())
+            return False
+        outdir = payload[0]
         self.dirty = False
         self.load(os.path.join(outdir, NOTICES_DATA_NAME))
         messagebox.showinfo(
@@ -1381,3 +1372,4 @@ class IssueFixerPanel(ttk.Frame):
             '字幕与问题报告已重新生成。\n繁体中文已重新经过繁化姬处理。',
             parent=self.winfo_toplevel(),
         )
+        return False

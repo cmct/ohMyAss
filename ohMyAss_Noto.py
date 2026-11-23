@@ -8,7 +8,9 @@ import tkinter as tk
 from tkinter import messagebox
 
 from app_ui import App, create_root
-from config_store import cleanup_stale_temp_folders, log_exception
+from config_store import (
+    ERROR_LOG_PATH, cleanup_stale_temp_folders, log_exception,
+)
 from theme_ui import UI_SCALE
 
 SINGLE_INSTANCE_HANDLE = None
@@ -39,10 +41,22 @@ def acquire_single_instance(name: str = 'Local\\ohMyAssNoto_SingleInstance') -> 
         return True
 
 
-if __name__ == '__main__':
+def _mark_update_success():
+    """更新批处理会设置该变量；新版本成功启动后写标记，失败则自动回滚。"""
+    marker = os.environ.get('OMA_UPDATE_MARKER')
+    if not marker:
+        return
+    try:
+        with open(marker, 'w', encoding='utf-8') as handle:
+            handle.write('ok')
+    except OSError as exc:
+        log_exception('写入更新标记', exc)
+
+
+def main():
     if not acquire_single_instance():
         messagebox.showinfo('ohMyAss Noto', '软件已经在运行，请使用已打开的窗口。')
-        sys.exit(0)
+        return 0
     # 仅冻结运行时清理临时解压目录，源码运行不碰其他程序的目录
     if getattr(sys, 'frozen', False):
         threading.Thread(target=cleanup_stale_temp_folders, daemon=True).start()
@@ -51,5 +65,26 @@ if __name__ == '__main__':
         root.tk.call('tk', 'scaling', UI_SCALE * 96.0 / 72.0)
     except tk.TclError:
         pass
-    app = App(root)
+    App(root)
+    root.update_idletasks()
+    # App 初始化成功后再写更新标记，启动失败时让批处理回滚
+    _mark_update_success()
     root.mainloop()
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except BaseException as exc:
+        log_exception('启动失败', exc)
+        try:
+            messagebox.showerror(
+                'ohMyAss Noto 启动失败',
+                f'启动失败：{exc}\n\n详细信息已写入：\n{ERROR_LOG_PATH}',
+            )
+        except Exception:
+            pass
+        sys.exit(1)

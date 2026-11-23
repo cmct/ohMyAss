@@ -21,6 +21,12 @@ APP_UPDATE_REPO = 'cmct/ohMyAss'
 APP_UPDATE_ASSET = 'ohMyAss Noto.exe'
 
 
+def _asset_key(name: str) -> str:
+    """把附件名归一化成只含字母数字的键，忽略空格、点号和版本差异。"""
+    stem = os.path.splitext(str(name or ''))[0].lower()
+    return re.sub(r'[^a-z0-9]', '', stem)
+
+
 def _app_assets_from_page(repo: str, tag: str):
     page = tools_request(
         f'https://github.com/{repo}/releases/expanded_assets/{urllib.parse.quote(tag)}',
@@ -70,8 +76,13 @@ def fetch_app_update():
         url = (f'https://github.com/{repo}/releases/latest/download/'
                f'{urllib.parse.quote(name)}')
         assets = [(name, url, '')]
+    wanted = _asset_key(APP_UPDATE_ASSET)
     for name, url, digest in assets:
-        if name.lower() == APP_UPDATE_ASSET.lower():
+        if _asset_key(name) == wanted:
+            return tag, url, name, digest
+    # GitHub 会把附件名里的空格规范成点号，按归一化名称再找一次
+    for name, url, digest in assets:
+        if 'ohmyass' in _asset_key(name):
             return tag, url, name, digest
     name, url, digest = assets[0]
     return tag, url, name, digest
@@ -133,7 +144,10 @@ def update_environment(base=None) -> dict:
 
 
 def build_app_update_script() -> str:
-    """生成更新批处理内容（纯 ASCII，路径全部通过环境变量传入）。"""
+    """生成更新批处理内容（纯 ASCII，路径全部通过环境变量传入）。
+
+    替换前备份旧 EXE；新版本启动后写入 MARKER 标记，超时未写入则自动回滚。
+    """
     lines = [
         '@echo off',
         'setlocal EnableExtensions',
@@ -147,6 +161,8 @@ def build_app_update_script() -> str:
         'echo target "%TARGET%">>"%LOG%"',
         'echo source "%SOURCE%">>"%LOG%"',
         'if not exist "%SOURCE%" goto missing',
+        'copy /Y "%TARGET%" "%TARGET%.old" >nul 2>&1',
+        'if errorlevel 1 echo backup failed, continue>>"%LOG%"',
         'set /a tries=0',
         ':wait',
         'tasklist /FI "PID eq %PID%" 2>nul | find "%PID%" >nul',
@@ -167,11 +183,27 @@ def build_app_update_script() -> str:
         'goto copytry',
         ':copied',
         'echo [%date% %time%] copied>>"%LOG%"',
+        'del /F /Q "%MARKER%" >nul 2>&1',
         'cd /d "%TARGETDIR%"',
         'start "" "%TARGET%"',
-        'if errorlevel 1 echo start failed>>"%LOG%"',
+        'set /a waits=0',
+        ':waitmarker',
+        'if exist "%MARKER%" goto started',
+        'ping -n 2 127.0.0.1 >nul',
+        'set /a waits+=1',
+        'if %waits% GEQ 15 goto rollback',
+        'goto waitmarker',
+        ':started',
         'echo [%date% %time%] started>>"%LOG%"',
+        'if exist "%TARGET%.old" del /F /Q "%TARGET%.old" >nul 2>&1',
         'rd /s /q "%SOURCEDIR%" >nul 2>&1',
+        'goto done',
+        ':rollback',
+        'echo [%date% %time%] new version did not start, rollback>>"%LOG%"',
+        'if not exist "%TARGET%.old" goto failed',
+        'copy /Y "%TARGET%.old" "%TARGET%" >nul 2>&1',
+        'del /F /Q "%TARGET%.old" >nul 2>&1',
+        'start "" "%TARGET%"',
         'goto done',
         ':missing',
         'echo [%date% %time%] source missing>>"%LOG%"',
@@ -219,12 +251,15 @@ def apply_app_update(new_exe: str):
     script = os.path.join(tempfile.gettempdir(), f'oma_update_{os.getpid()}.bat')
     content = build_app_update_script()
     env = update_environment()
+    marker = os.path.join(
+        tempfile.gettempdir(), f'oma_update_ok_{os.getpid()}.flag')
     env.update({
         'PID': str(os.getpid()),
         'TARGET': current,
         'TARGETDIR': folder,
         'SOURCE': new_exe,
         'SOURCEDIR': os.path.dirname(new_exe),
+        'MARKER': marker,
         'LOG': log_path,
     })
     try:

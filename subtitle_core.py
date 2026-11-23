@@ -6,6 +6,7 @@ import re
 import json
 import html
 import time
+import threading
 import zhconv
 from enum import Enum
 from collections import Counter
@@ -18,11 +19,21 @@ try:
 except ImportError:
     Image = ImageChops = None
 
-from config_store import get_output_dir, log_exception, write_text_with_fallback
+from config_store import (
+    atomic_write_text, get_output_dir, log_exception, write_text_with_fallback,
+)
 from reports import (
     NOTICES_DATA_NAME, NOTICES_REPORT_NAME, TAIWAN_REPORT_NAME, build_notices_html,
     build_taiwan_compare_html,
 )
+from subtitle_outputs import (
+    OUT_BILINGUAL, OUT_CHS, OUT_CHT, OUT_ENG,
+    has_special_effect, match_cjk, match_latin, output_layout,
+)
+
+
+class ProcessCancelled(Exception):
+    """用户在生成过程中取消。"""
 
 
 match_paragraph_script_info = re.compile(r'\[Script Info\]', re.I)
@@ -36,29 +47,13 @@ match_events_dialogue = re.compile(r'^\s*Dialogue:', re.I)
 match_events_newline = re.compile(r'\\N')
 match_events_fs = re.compile(r'\\fs(\d+)', re.I)
 
-match_events_override_block = re.compile(r'\{[^}]*\}')
 match_override_split = re.compile(r'(\{[^}]*\})')
-match_events_special_effect = re.compile(
-    r'\\move\(|\\pos\(|\\org\(|\\i?clip\(|\\fad\(|\\t\(|'
-    r'\\[kK]|\\fsc[xy]?|\\fsp|\\fr[xyz]?|\\be|\\bord|\\shad|'
-    r'\\alpha|\\[1-4]a|\\a\d+|\\h(?![A-Za-z])|\\q\d|\\p\d',
-    re.I,
-)
 match_events_move = re.compile(r'\\move\(([\d.]+),([\d.]+),([\d.]+),([\d.]+)', re.I)
 match_events_pos = re.compile(r'\\pos\(([\d.]+),([\d.]+)', re.I)
 match_events_org = re.compile(r'\\org\(([\d.]+),([\d.]+)', re.I)
 match_events_iclip = re.compile(r'\\iclip\(([\d.]+),([\d.]+),([\d.]+),([\d.]+)', re.I)
 match_events_clip = re.compile(r'\\clip\(([\d.]+),([\d.]+),([\d.]+),([\d.]+)', re.I)
 
-def has_special_effect(text: str) -> bool:
-    for block in match_events_override_block.findall(text):
-        if match_events_special_effect.search(block):
-            return True
-    return False
-
-
-match_cjk = re.compile(r'[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]')
-match_latin = re.compile(r'[A-Za-z]')
 match_override_tag = re.compile(r'{.*?}')
 match_font_tag = re.compile(r'\\fn[^\\}]*')
 match_reset_tag = re.compile(r'\\r[^\\}]*')
@@ -73,11 +68,6 @@ match_underline_tag = re.compile(r'\\u[01]?(?![A-Za-z])', re.I)
 match_strike_tag = re.compile(r'\\s[01]?(?![A-Za-z])', re.I)
 match_encoding_tag = re.compile(r'\\fe[^\\}]*', re.I)
 match_empty_tag = re.compile(r'\{\s*\}')
-
-OUT_BILINGUAL = '简英双语'
-OUT_CHS = '简体中文'
-OUT_CHT = '繁体中文'
-OUT_ENG = '英文'
 
 MIN_EVENT_DURATION_MS = 500
 MIN_EVENT_GAP_MS = 200
@@ -487,20 +477,7 @@ class Aegisub():
         self.source_style_lines = {}
         self.effect_style_names = set()
         self.extra_style_lines = {}
-        if is_HDR:
-            self.contents = {
-                '1-简英双语-HDR-zh': OUT_BILINGUAL,
-                '3-简体中文-HDR-zh': OUT_CHS,
-                '4-繁体中文-HDR-zh': OUT_CHT,
-                '5-英文-HDR-en': OUT_ENG,
-            }
-        else:
-            self.contents = {
-                '1-简英双语-zh': OUT_BILINGUAL,
-                '2-简体中文-zh': OUT_CHS,
-                '3-繁体中文-zh': OUT_CHT,
-                '4-英文-en': OUT_ENG,
-            }
+        self.contents = dict(output_layout(is_HDR, False).outputs)
         self.notices = []
         self.notice_index = 0
         self.timeline_events = []
@@ -614,7 +591,7 @@ class Aegisub():
                         and not self.timeline_pair_exempt(
                             previous['align'], event['align'])):
                     self.notices.append(
-                        f"{event['index']},与第{previous['index']}条字幕"
+                        f"{previous['index']},与下一条({event['index']})字幕"
                         f"间隔不足{min_gap_ms}ms,请处理\n"
                     )
             if previous_end is None or event['end'] > previous_end:
@@ -1533,18 +1510,58 @@ def fill_dialogue(sub: Aegisub, contents: dict, line: str):
         contents[OUT_ENG].append(build_dialogue(data, style, text_eng))
 
 
-def zhconvert_api(texts, converter=ZHCONVERT_CONVERTER):
-    """批量调用繁化姬，返回与 texts 等长的转换结果；失败时抛出异常。"""
-    results = []
+_ZHCONVERT_CACHE = {}
+_ZHCONVERT_CACHE_LIMIT = 20000
+_ZHCONVERT_CACHE_LOCK = threading.Lock()
+
+
+def _cache_put(cache, key, value):
+    if not key:
+        return
+    with _ZHCONVERT_CACHE_LOCK:
+        cache[key] = value
+        while len(cache) > _ZHCONVERT_CACHE_LIMIT:
+            try:
+                cache.pop(next(iter(cache)))
+            except (StopIteration, KeyError):
+                break
+
+
+def zhconvert_api(texts, converter=ZHCONVERT_CONVERTER, cache=None,
+                  progress=None, cancel_event=None):
+    """批量调用繁化姬，返回与 texts 等长的转换结果；失败时抛出异常。
+
+    cache 为「原文 -> 译文」字典，命中时不再发起请求；不传则使用会话级缓存。
+    这样重复保存同一批字幕时不必重新转换。
+    """
+    if cache is None:
+        cache = _ZHCONVERT_CACHE
+    results = [None] * len(texts)
+    pending = []
+    for position, text in enumerate(texts):
+        with _ZHCONVERT_CACHE_LOCK:
+            cached = cache.get(text)
+        if cached is None:
+            pending.append(position)
+        else:
+            results[position] = cached
+
+    total = len(pending)
+    done = 0
     index = 0
-    while index < len(texts):
+    while index < total:
+        if cancel_event is not None and cancel_event.is_set():
+            raise ProcessCancelled('已取消繁化姬转换')
+        group_positions = []
         group = []
         size = 0
-        while index + len(group) < len(texts):
-            item = texts[index + len(group)]
+        while index + len(group) < total:
+            position = pending[index + len(group)]
+            item = texts[position]
             if group and size + len(item) + 1 > ZHCONVERT_MAX_CHARS:
                 break
             group.append(item)
+            group_positions.append(position)
             size += len(item) + 1
         body = urllib.parse.urlencode({
             'converter': converter,
@@ -1578,8 +1595,13 @@ def zhconvert_api(texts, converter=ZHCONVERT_CONVERTER):
         pieces = (result.get('data') or {}).get('text', '').split('\n')
         if len(pieces) != len(group):
             raise RuntimeError('繁化姬返回行数与提交行数不一致')
-        results.extend(pieces)
+        for position, piece in zip(group_positions, pieces):
+            results[position] = piece
+            _cache_put(cache, texts[position], piece)
         index += len(group)
+        done += len(group)
+        if progress is not None and total:
+            progress(int(done * 100 / total))
     return results
 
 
@@ -1605,11 +1627,13 @@ def join_dialogue_text(layout, values):
     return '\\N'.join(pieces)
 
 
-def convert_cht_contents(lines, indexes=None, use_api=True):
+def convert_cht_contents(lines, indexes=None, use_api=True, cache=None,
+                         progress=None, cancel_event=None):
     """把繁体输出转成台湾繁体。
 
     返回 (新行, 对比记录, 错误信息, 台湾化后超长行)。
     对比记录以普通繁体（本地简繁转换）为基准，与台湾化结果比较。
+    cache 用于复用繁化姬结果，重复保存时避免重复请求。
     """
     entries = []
     all_parts = []
@@ -1632,13 +1656,19 @@ def convert_cht_contents(lines, indexes=None, use_api=True):
         })
         all_parts.extend(parts)
 
+    if cancel_event is not None and cancel_event.is_set():
+        raise ProcessCancelled('已取消台湾化')
     # 普通繁体：本地简繁转换，作为对比基准
     local_parts = [zhconv.convert(part, 'zh-hant') for part in all_parts]
     taiwan_parts = local_parts
     error = ''
     if use_api and all_parts:
         try:
-            taiwan_parts = zhconvert_api(all_parts)
+            taiwan_parts = zhconvert_api(
+                all_parts, cache=cache, progress=progress,
+                cancel_event=cancel_event)
+        except ProcessCancelled:
+            raise
         except (OSError, ValueError, RuntimeError, KeyError) as exc:
             error = f'{type(exc).__name__}: {exc}'
             log_exception('繁体台湾化', exc)
@@ -1684,12 +1714,23 @@ def convert_cht_contents(lines, indexes=None, use_api=True):
                     'length': length,
                 })
     return result, changes, error, overlong
+def _report_progress(progress, value, message=''):
+    if progress is None:
+        return
+    value = max(0, min(100, int(value)))
+    try:
+        progress(value, message)
+    except TypeError:
+        progress(value)
 
 
-def process_file(filename: str, is_HDR: bool, is_mid_black: bool, meta: dict = None,
-                 write_outputs: bool = True):
-    meta = meta or {}
-    sub = Aegisub(filename, is_HDR, is_mid_black)
+def _check_cancel(cancel_event):
+    if cancel_event is not None and cancel_event.is_set():
+        raise ProcessCancelled('已取消生成')
+
+
+def _apply_subtitle_options(sub, meta):
+    """应用样式、术语、HDR 亮度与双语行距等生成选项。"""
     custom_styles = meta.get('style_lines')
     if isinstance(custom_styles, list):
         cleaned = []
@@ -1734,64 +1775,10 @@ def process_file(filename: str, is_HDR: bool, is_mid_black: bool, meta: dict = N
             fsvp_values.get('zh_note_single_line', 12.0)))
     except (TypeError, ValueError, AttributeError):
         sub.fsvp_note_double = 12.0
-    sub.read_file()
-    sub.detect_source_type()
 
-    if sub.source_is_chinese_only:
-        if is_HDR:
-            sub.contents = {
-                '1-简体中文-HDR-zh': OUT_CHS,
-                '3-繁体中文-HDR-zh': OUT_CHT,
-            }
-        else:
-            sub.contents = {
-                '1-简体中文-zh': OUT_CHS,
-                '2-繁体中文-zh': OUT_CHT,
-            }
-    elif is_HDR:
-        sub.contents = {
-            '1-简英双语-HDR-zh': OUT_BILINGUAL,
-            '3-简体中文-HDR-zh': OUT_CHS,
-            '4-繁体中文-HDR-zh': OUT_CHT,
-            '5-英文-HDR-en': OUT_ENG,
-        }
-    else:
-        sub.contents = {
-            '1-简英双语-zh': OUT_BILINGUAL,
-            '2-简体中文-zh': OUT_CHS,
-            '3-繁体中文-zh': OUT_CHT,
-            '4-英文-en': OUT_ENG,
-        }
 
-    meta = meta or {}
-    title = str(meta.get('title', '') or '').strip()
-    updated_by = str(meta.get('script_updated_by', '') or '').strip()
-    source_label = str(meta.get('source_label', '') or '').strip() or os.path.basename(filename)
-    if not title:
-        raise ValueError('影片名为必填项，请填写后再生成')
-    if not updated_by:
-        raise ValueError('字幕员为必填项，请填写后再生成')
-
-    output_dir = get_output_dir(filename, title, meta.get('output_root', ''))
-    if output_dir is None:
-        raise ValueError('影片名不能用于文件夹名，请修改')
-    try:
-        os.makedirs(output_dir, exist_ok=True)
-    except OSError as exc:
-        raise ValueError(f'无法创建输出文件夹：{exc}')
-
-    contents = {
-        OUT_BILINGUAL: [],
-        OUT_CHS: [],
-        OUT_CHT: [],
-        OUT_ENG: [],
-    }
-
-    mode = Section.OTHERS
-    script_info_written = False
-    styles_written = False
-
-    # 先收集源样式与特效字幕使用的样式，保证写入样式表时就能包含它们
+def _collect_source_styles(sub):
+    """先收集源样式与特效字幕使用的样式，保证写入样式表时就能包含它们。"""
     for raw in sub.raw_contents:
         stripped = raw.strip()
         if stripped.lower().startswith('style:'):
@@ -1811,7 +1798,20 @@ def process_file(filename: str, is_HDR: bool, is_mid_black: bool, meta: dict = N
         if source_line:
             sub.extra_style_lines[style_name] = source_line
 
-    for line in sub.raw_contents:
+
+def _build_output_contents(sub, contents, meta, progress=None, cancel_event=None):
+    """按 ASS 段落把源字幕转换成各语言的输出行。"""
+    mode = Section.OTHERS
+    script_info_written = False
+    styles_written = False
+    total = max(1, len(sub.raw_contents))
+
+    for position, line in enumerate(sub.raw_contents):
+        if position % 25 == 0:
+            _check_cancel(cancel_event)
+            _report_progress(
+                progress, 8 + 47 * position / total,
+                '正在转换字幕文本…')
         if match_paragraph_script_info.search(line):
             mode = Section.SCRIPT_INFO
             if not script_info_written:
@@ -1832,12 +1832,13 @@ def process_file(filename: str, is_HDR: bool, is_mid_black: bool, meta: dict = N
         else:
             if mode == Section.SCRIPT_INFO:
                 # 只读取原始分辨率用于坐标缩放，不输出原始 Script Info
-                if match_script_info_play_x.search(line):
-                    match = match_script_info_play_x.search(line)
+                match = match_script_info_play_x.search(line)
+                if match:
                     sub.set_xRatio(1920 / int(match.group(1)))
-                elif match_script_info_play_y.search(line):
+                else:
                     match = match_script_info_play_y.search(line)
-                    sub.set_yRatio(1080 / int(match.group(1)))
+                    if match:
+                        sub.set_yRatio(1080 / int(match.group(1)))
             elif mode == Section.STYLES:
                 if line.lstrip().lower().startswith('style:'):
                     style_data = line.split(',')
@@ -1873,71 +1874,72 @@ def process_file(filename: str, is_HDR: bool, is_mid_black: bool, meta: dict = N
     if not script_info_written:
         for key in contents:
             contents[key].insert(0, get_script_info(meta))
+    _report_progress(progress, 55, '文本转换完成')
 
-    # 繁体输出统一做台湾化：优先走繁化姬，失败时退回本地转换
+
+def _apply_taiwan_conversion(sub, contents, meta, output_dir, filename, title,
+                             progress=None, cancel_event=None):
+    """繁体输出统一做台湾化：优先走繁化姬，失败时退回本地转换。"""
     use_taiwan = bool(meta.get('taiwan', True))
     taiwan_error = ''
-    if contents[OUT_CHT]:
-        contents[OUT_CHT], taiwan_changes, taiwan_error, taiwan_overlong = convert_cht_contents(
-            contents[OUT_CHT], sub.cht_indexes, use_api=use_taiwan)
-        for item in taiwan_overlong:
-            if use_taiwan:
-                sub.add_notice(f'台湾化后单行过长，中文：{item["length"]},请处理', index=item['index'])
-        report_path = os.path.join(output_dir, TAIWAN_REPORT_NAME)
-        if taiwan_error:
-            sub.add_notice('繁化姬台湾化失败,请处理', index=0)
-        if write_outputs:
-            if use_taiwan and (taiwan_changes or taiwan_error):
-                write_text_with_fallback(
-                    report_path,
-                    build_taiwan_compare_html(title, filename, taiwan_changes, taiwan_error),
-                )
-            elif os.path.exists(report_path):
-                try:
-                    os.remove(report_path)
-                except OSError:
-                    pass
+    if not contents[OUT_CHT]:
+        return taiwan_error
+    _check_cancel(cancel_event)
+    _report_progress(progress, 58, '正在做繁体台湾化…')
+    contents[OUT_CHT], taiwan_changes, taiwan_error, taiwan_overlong = convert_cht_contents(
+        contents[OUT_CHT], sub.cht_indexes, use_api=use_taiwan,
+        progress=lambda value: _report_progress(progress, 58 + 17 * value / 100),
+        cancel_event=cancel_event,
+        cache=meta.get('cht_cache'),
+    )
+    for item in taiwan_overlong:
+        if use_taiwan:
+            sub.add_notice(f'台湾化后单行过长，中文：{item["length"]},请处理', index=item['index'])
+    report_path = os.path.join(output_dir, TAIWAN_REPORT_NAME)
+    if taiwan_error:
+        sub.add_notice('繁化姬台湾化失败,请处理', index=0)
+    # 对比报告属于分析产物，即使只重新分析（不写字幕）也要刷新
+    if use_taiwan and (taiwan_changes or taiwan_error):
+        write_text_with_fallback(
+            report_path,
+            build_taiwan_compare_html(title, filename, taiwan_changes, taiwan_error),
+        )
+    elif os.path.exists(report_path):
+        try:
+            os.remove(report_path)
+        except OSError:
+            pass
+    _report_progress(progress, 76, '台湾化完成')
+    return taiwan_error
 
-    # HDR 时额外另存一份未做 HDR 颜色映射的 SDR 版本
-    sdr_content = None
-    sdr_name = ''
-    if is_HDR:
-        if sub.source_is_chinese_only:
-            sdr_content = list(contents[OUT_CHS])
-            sdr_name = '2-简体中文-SDR-zh.ass'
-        else:
-            sdr_content = list(contents[OUT_BILINGUAL])
-            sdr_name = '2-简英双语-SDR-zh.ass'
 
-    # HDR 时把行内颜色标签按 ssaHdrify 的映射一起转换
-    if is_HDR:
-        for key in contents:
-            contents[key] = [
-                hdrify_event_colours(line, sub.hdr_brightness) if line.startswith('Dialogue:') else line
-                for line in contents[key]
-            ]
-
+def _write_output_files(sub, contents, output_dir, sdr_content, sdr_name,
+                        progress=None, cancel_event=None):
+    """写出各语言字幕与 SDR 版本，返回被占用后改名的文件列表。"""
     renamed_outputs = []
-    if write_outputs:
-        for key, value in sub.contents.items():
-            if sub.source_is_chinese_only and value in (OUT_BILINGUAL, OUT_ENG):
-                continue
-            file = os.path.join(output_dir, f'{key}.ass')
-            saved = write_text_with_fallback(file, ''.join(contents[f'{value}']))
-            if os.path.basename(saved) != os.path.basename(file):
-                renamed_outputs.append((os.path.basename(file), os.path.basename(saved)))
+    for key in sub.contents:
+        _check_cancel(cancel_event)
+        value = sub.contents[key]
+        if value not in contents:
+            continue
+        file = os.path.join(output_dir, key)
+        saved = write_text_with_fallback(file, ''.join(contents[value]))
+        if os.path.basename(saved) != os.path.basename(file):
+            renamed_outputs.append((os.path.basename(file), os.path.basename(saved)))
+    if sdr_content is not None:
+        _check_cancel(cancel_event)
+        file = os.path.join(output_dir, sdr_name)
+        saved = write_text_with_fallback(
+            file, ''.join(build_sdr_bilingual_lines(sub, sdr_content)))
+        if os.path.basename(saved) != os.path.basename(file):
+            renamed_outputs.append((os.path.basename(file), os.path.basename(saved)))
+    _report_progress(progress, 92, '字幕文件已写出')
+    return renamed_outputs
 
-        if sdr_content is not None:
-            file = os.path.join(output_dir, sdr_name)
-            saved = write_text_with_fallback(
-                file, ''.join(build_sdr_bilingual_lines(sub, sdr_content)))
-            if os.path.basename(saved) != os.path.basename(file):
-                renamed_outputs.append((os.path.basename(file), os.path.basename(saved)))
 
-        for expected, saved in renamed_outputs:
-            sub.add_notice(
-                f'输出文件被占用，{expected} 已另存为 {saved},请检查', index=0)
-
+def _write_notice_files(sub, filename, title, source_label, output_dir, meta,
+                        is_HDR, is_mid_black, updated_by):
+    """写问题报告 HTML 与问题数据 JSON，返回 HTML 路径。"""
     sub.check_timeline_overlaps()
     sub.check_timeline_gaps()
     sub.notices.sort(key=lambda notice: int(notice.split(',', 1)[0]))
@@ -1957,35 +1959,121 @@ def process_file(filename: str, is_HDR: bool, is_mid_black: bool, meta: dict = N
         except ValueError:
             continue
         notices_data.append({'index': index, 'problem': parts[1], 'need': parts[2]})
+    payload = json.dumps({
+        'version': 1,
+        'source': os.path.abspath(filename),
+        'source_label': source_label,
+        'output_dir': os.path.abspath(output_dir),
+        'title': title,
+        'is_hdr': bool(is_HDR),
+        'is_mid_black': bool(is_mid_black),
+        'chinese_only': bool(sub.source_is_chinese_only),
+        'meta': {
+            'title': title,
+            'script_updated_by': updated_by,
+            'original_script': meta.get('original_script', ''),
+            'original_translation': meta.get('original_translation', ''),
+            'original_timing': meta.get('original_timing', ''),
+            'original_editing': meta.get('original_editing', ''),
+            'taiwan': bool(meta.get('taiwan', True)),
+            'hdr_brightness': sub.hdr_brightness,
+            'source_label': source_label,
+            'style_fsvp': meta.get('style_fsvp', {}),
+            'style_lines': list(sub.style_lines or SDR_STYLES),
+            'glossary': list(sub.glossary),
+        },
+        'notices': notices_data,
+    }, ensure_ascii=False, indent=2)
     try:
-        with open(os.path.join(output_dir, NOTICES_DATA_NAME), 'w', encoding='utf-8') as handle:
-            json.dump({
-                'version': 1,
-                'source': os.path.abspath(filename),
-                'source_label': source_label,
-                'output_dir': os.path.abspath(output_dir),
-                'title': title,
-                'is_hdr': bool(is_HDR),
-                'is_mid_black': bool(is_mid_black),
-                'meta': {
-                    'title': title,
-                    'script_updated_by': updated_by,
-                    'original_script': meta.get('original_script', ''),
-                    'original_translation': meta.get('original_translation', ''),
-                    'original_timing': meta.get('original_timing', ''),
-                    'original_editing': meta.get('original_editing', ''),
-                    'taiwan': bool(meta.get('taiwan', True)),
-                    'hdr_brightness': sub.hdr_brightness,
-                    'source_label': source_label,
-                    'style_fsvp': meta.get('style_fsvp', {}),
-                    'style_lines': list(sub.style_lines or SDR_STYLES),
-                    'glossary': list(sub.glossary),
-                },
-                'notices': notices_data,
-            }, handle, ensure_ascii=False, indent=2)
+        atomic_write_text(
+            os.path.join(output_dir, NOTICES_DATA_NAME), payload, encoding='utf-8')
     except OSError as exc:
         # 数据文件写不进去时报告页仍可用，但问题修复页无法自动载入
         log_exception('写入问题数据', exc)
+    return html_file
+
+
+def process_file(filename: str, is_HDR: bool, is_mid_black: bool, meta: dict = None,
+                 write_outputs: bool = True, progress=None, cancel_event=None):
+    meta = meta or {}
+    _check_cancel(cancel_event)
+    _report_progress(progress, 2, '正在读取字幕…')
+    sub = Aegisub(filename, is_HDR, is_mid_black)
+    _apply_subtitle_options(sub, meta)
+    sub.read_file()
+    sub.detect_source_type()
+    _check_cancel(cancel_event)
+
+    layout = output_layout(is_HDR, sub.source_is_chinese_only)
+    sub.contents = dict(layout.outputs)
+
+    title = str(meta.get('title', '') or '').strip()
+    updated_by = str(meta.get('script_updated_by', '') or '').strip()
+    source_label = str(meta.get('source_label', '') or '').strip() or os.path.basename(filename)
+    if not title:
+        raise ValueError('影片名为必填项，请填写后再生成')
+    if not updated_by:
+        raise ValueError('字幕员为必填项，请填写后再生成')
+
+    output_dir = get_output_dir(filename, title, meta.get('output_root', ''))
+    if output_dir is None:
+        raise ValueError('影片名不能用于文件夹名，请修改')
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+    except OSError as exc:
+        raise ValueError(f'无法创建输出文件夹：{exc}')
+
+    contents = {
+        OUT_BILINGUAL: [],
+        OUT_CHS: [],
+        OUT_CHT: [],
+        OUT_ENG: [],
+    }
+    _report_progress(progress, 5, '正在解析样式…')
+    _collect_source_styles(sub)
+    _build_output_contents(sub, contents, meta, progress, cancel_event)
+    _check_cancel(cancel_event)
+
+    _apply_taiwan_conversion(
+        sub, contents, meta, output_dir, filename, title,
+        progress, cancel_event)
+
+    # HDR 时额外另存一份未做 HDR 颜色映射的 SDR 版本
+    sdr_content = None
+    sdr_name = ''
+    if is_HDR:
+        if sub.source_is_chinese_only:
+            sdr_content = list(contents[OUT_CHS])
+        else:
+            sdr_content = list(contents[OUT_BILINGUAL])
+        sdr_name = layout.sdr_name
+
+    # HDR 时把行内颜色标签按 ssaHdrify 的映射一起转换
+    if is_HDR:
+        _check_cancel(cancel_event)
+        _report_progress(progress, 78, '正在做 HDR 颜色映射…')
+        for key in contents:
+            contents[key] = [
+                hdrify_event_colours(line, sub.hdr_brightness)
+                if line.startswith('Dialogue:') else line
+                for line in contents[key]
+            ]
+
+    if write_outputs:
+        _check_cancel(cancel_event)
+        _report_progress(progress, 82, '正在写出字幕文件…')
+        renamed_outputs = _write_output_files(
+            sub, contents, output_dir, sdr_content, sdr_name, progress, cancel_event)
+        for expected, saved in renamed_outputs:
+            sub.add_notice(
+                f'输出文件被占用，{expected} 已另存为 {saved},请检查', index=0)
+
+    _check_cancel(cancel_event)
+    _report_progress(progress, 95, '正在生成问题报告…')
+    html_file = _write_notice_files(
+        sub, filename, title, source_label, output_dir, meta,
+        is_HDR, is_mid_black, updated_by)
+    _report_progress(progress, 100, '完成')
     return html_file, output_dir, sub.source_is_chinese_only
 
 IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff', '.webp')
@@ -2006,7 +2094,13 @@ def get_black_bar_type(scaled_bottom: float) -> str:
 
 
 def detect_black_bars(image_path: str, progress_callback=None) -> dict:
-    """逐列扫描图片上下黑边，返回原始像素和 1080p 等效值。"""
+    """检测上下黑边，并按实际画面比例推算 1080p 等效黑边。
+
+    截图可能已经裁掉黑边（例如 1920×804 的 2.39:1 画面），此时像素扫描
+    结果为 0，但仍应按画面比例推算为 1080p 的 138px 黑边。因此黑边类型
+    统一使用「实际画面高度 → 16:9 画框」的推算值，而不是只看检测到的
+    黑边像素。
+    """
     if Image is None:
         raise RuntimeError('黑边检测需要 Pillow')
     with Image.open(image_path) as source:
@@ -2014,7 +2108,7 @@ def detect_black_bars(image_path: str, progress_callback=None) -> dict:
         if not width or not height:
             raise ValueError('图片尺寸无效')
         red, green, blue = source.convert('RGB').split()
-        # 取三分量最大值，等价于原来的 max(pixel)，但由 C 层完成
+        # 取三分量最大值，等价于原来的 max(pixel)，但在 C 层完成
         bright = ImageChops.lighter(ImageChops.lighter(red, green), blue)
         data = bright.tobytes()
 
@@ -2023,7 +2117,7 @@ def detect_black_bars(image_path: str, progress_callback=None) -> dict:
     columns = list(range(0, width, step))
     total = len(columns)
 
-    # 用字节表把“亮于阈值”标成 1，再用 find/rfind 定位上下边缘
+    # 用字节表把“亮于阈值”标记成 1，再用 find/rfind 定位上下边缘
     mask = bytes(1 if value > BLACK_THRESHOLD else 0 for value in range(256))
     masked = data.translate(mask)
     last_row_offset = (height - 1) * width
@@ -2052,20 +2146,43 @@ def detect_black_bars(image_path: str, progress_callback=None) -> dict:
     common_bottom = Counter(bottom_edges).most_common(1)[0][0]
     bottom_bar = height - 1 - common_bottom
 
-    # 全黑图片
+    # 边缘校验：只有最外侧一行确实接近纯黑，才把检测结果当成黑边。
+    # 这样可以避免把画面顶部/底部的深色树林、夜景误认为黑边。
+    edge_limit = max(1, int(width * 0.02))
+    if top_bar > 0 and masked[0:width].count(1) > edge_limit:
+        top_bar = 0
+    if bottom_bar > 0 and masked[last_row_offset:last_row_offset + width].count(1) > edge_limit:
+        bottom_bar = 0
+
+    # 全黑图片或几乎全黑，按无黑边处理，避免推算失真
     if top_bar == height and common_bottom == 0:
         top_bar = 0
         bottom_bar = 0
 
-    scaled_bottom = bottom_bar / scale_factor if scale_factor else bottom_bar
+    content_height = height - top_bar - bottom_bar
+    if content_height < max(1, height // 20):
+        top_bar = 0
+        bottom_bar = 0
+        content_height = height
+
+    content_width = width
+    aspect = content_width / content_height if content_height else width / height
+    equivalent_height = 1920.0 / aspect if aspect else 0.0
+    inferred_bottom = max(0.0, (1080.0 - equivalent_height) / 2.0)
+    detected_bottom = bottom_bar / scale_factor if scale_factor else float(bottom_bar)
+
     return {
         'width': width,
         'height': height,
         'top': top_bar,
         'bottom': bottom_bar,
         'scale': scale_factor,
-        'scaled_bottom': scaled_bottom,
-        'type': get_black_bar_type(scaled_bottom),
+        'scaled_bottom': inferred_bottom,
+        'detected_scaled_bottom': detected_bottom,
+        'content_height': content_height,
+        'aspect': aspect,
+        'cropped': top_bar == 0 and bottom_bar == 0 and inferred_bottom > 1.0,
+        'type': get_black_bar_type(inferred_bottom),
     }
 
 
